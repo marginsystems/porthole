@@ -3,6 +3,7 @@
 !/.gitignore
 !/.env.example
 !/README.md
+!/LICENSE
 !/porthole
 !/lowctx.py
 !/start-server.sh

@@ -207,3 +207,8 @@ install.sh        venv + mlx-vlm + PATH link
 requant.py        8-bit → 4-bit re-quantizer (shard by shard)
 bench/            live tests and fixtures
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE). The model weights are not part of this repo and carry their own license
+(the default Qwen build is Apache-2.0; check the model card).
