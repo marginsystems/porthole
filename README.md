@@ -27,24 +27,32 @@ about 4 minutes *per step*. A normal agent loop of tool calls, file dumps and lo
 porthole keeps every step's prompt at about **12k tokens** or less no matter how long the session runs:
 
 ```
-            ┌───────────────────────── what Qwen sees each step (≤~12k tok) ───────────────────────┐
-  you  ───▶ │ short system prompt │ request │ working notes (compressed history) │ last 2 tool steps │ ──▶ Qwen (local)
-            └──────────────────────────────────────────────────────────────────────────────────────┘
-                                                     ▲                                               │
-                     old steps folded into notes ────┘                                               │ delegate(task)
-                     big outputs saved to .lowctx/ + digested                                        ▼
-                     long pastes saved + briefed                                     DeepSeek subagent (cloud)
-                     file reads paged with line numbers                              web_search · fetch · read · grep · ls
-                                                                                     → ≤300-word sourced report
+                                ┌──────────── Qwen, local (the orchestrator) ────────────┐
+  you ──▶ request ──▶ prompt ≤~12k tok: system · request · working notes · last 2 steps   │──▶ answer
+                                └───┬──────────────────────────┬─────────────────────────┘
+                                    │ ask("what's the KV cap   │ ask("cheapest Trello tier,
+                                    │  in start-server.sh?")   │  with URL")      ← fired together,
+                                    ▼                          ▼                   run in parallel
+                          ┌──────────────────┐       ┌──────────────────┐
+                          │ DeepSeek worker  │       │ DeepSeek worker  │   read-only tools:
+                          │ reads whole files│       │ searches, fetches│   read · grep · ls ·
+                          └────────┬─────────┘       └────────┬─────────┘   web_search · fetch
+                                   └── ANSWER + EVIDENCE (file:line / URL), ≤200 words ──▶ back to Qwen
 ```
 
-* **Qwen orchestrates.** It decides what to look at, makes the judgment calls and writes the answer.
-* **DeepSeek does the legwork.** `delegate(task)` runs a subagent with a large context and read-only tools.
-  It searches, fetches and reads as many pages as it needs, and only its short report enters Qwen's window.
-* **If DeepSeek refuses** (refusal text, content filter, moderation error) or is down, Qwen gets
-  `[delegate declined …] Do this part yourself` and carries on with its own tools. Nothing stops.
-* **The compressor** (also DeepSeek when a key is set) folds old turns into notes, digests big tool output and
-  briefs long pastes. Without a key, the local model compresses its own context: slower, but fully offline.
+* **Qwen holds the big picture.** It understands your request, plans, judges, edits and writes the answer.
+* **Subagents answer narrow questions.** Instead of paging through a file to learn one fact, Qwen calls
+  `ask(question, hints)`: *"what is the monthly churn in revenue.csv?"*, *"where is `retry_limit` set and to
+  what?"*, *"cheapest paid ClickUp tier, with URL"*. Each ask is an independent DeepSeek worker with a large
+  context and read-only tools. It reads whole files, greps and browses, then returns only
+  `ANSWER / EVIDENCE / UNSURE`. All asks in one step run in parallel, on a live board in the CLI.
+* **Workers never see your request.** They get only Qwen's question. Understanding the task is Qwen's job;
+  DeepSeek just does lookups.
+* **If a worker refuses** (refusal text, content filter, moderation error) or fails, Qwen gets
+  `[ask declined …] Find it yourself` and uses its own read/grep/search. Nothing stops.
+* **The compressor keys on Qwen's calls too.** Big tool output is reduced to what *that call* was after (the
+  call's `purpose`, or Qwen's own words before it), and old steps are folded into a factual log of calls and
+  results. Without a key, the local model compresses its own context: slower, but fully offline.
 
 ## Requirements
 
@@ -97,7 +105,7 @@ work. What you do with it is on you. Read the model card.
 | command | what it does |
 |---|---|
 | `porthole` | chat in the current folder (advisor mode); starts the model server if it's down |
-| `porthole chat --mode code` | coding-agent mode: ls/read/grep/edit/write/bash (+ delegate for docs/API lookups) |
+| `porthole chat --mode code` | coding-agent mode: ask/ls/read/grep/edit/write/bash |
 | `porthole run "task"` | one-shot: do the task in this folder, print the result, exit (code mode) |
 | `porthole run --mode advisor "question"` | one-shot opinion |
 | `porthole up` / `porthole down` | start / stop the model server. **down frees ~16 GB**; do it when you're done |
@@ -126,17 +134,25 @@ Scratch data (saved pages, big outputs, `transcript.jsonl`) goes to `./.lowctx/`
   investor tear this apart?"*
 * **Pre-mortems and red-teaming your own stuff.** Landing page copy, a hiring plan, a launch checklist:
   *"Assume this failed in 6 months. Why?"*
-* **Offline thinking partner.** Leave `DEEPSEEK_API_KEY` empty and nothing leaves the machine. Use it for
-  strategy, journaling or anything you'd rather not send to a cloud model.
+* **Offline thinking partner.** Leave `DEEPSEEK_API_KEY` empty and no model outside your Mac sees anything. Use it
+  for strategy, journaling or anything you'd rather not send to a cloud model. In advisor mode, `web_search` and
+  `fetch` still go online when Qwen uses them; switch to `/mode code` or just don't ask for research.
 
 ## Privacy
 
 | stays on your Mac | goes to DeepSeek (only if a key is set) |
 |---|---|
-| the model, every prompt Qwen sees, your chat | subagent tasks and everything subagents fetch or **read** (including local files you point them at) |
-| file reads/edits Qwen does itself, bash commands | text the compressor summarizes: old turns, big tool output, long pastes |
+| the model and every prompt Qwen sees | each `ask` question and everything its worker reads or fetches, **including your local files** |
+| file edits and bash commands Qwen runs itself | text the compressor summarizes: old turns of your chat, big tool output, long pastes |
+| `.lowctx/` (saved pastes, outputs, transcript): workers can't open it | |
 
-For sensitive files, ask Qwen to read them itself and delegate only web research, or remove the key.
+With a key set, Qwen sends most file lookups to workers, so assume the files it works with reach DeepSeek.
+Workers can only read, grep and list inside the folder you launched porthole from. They can never open
+credential-looking files (`.env*`, `*.pem`/`*.key`, `id_rsa*`, `~/.ssh`, `.aws`, `credentials*`, …), even if a
+file or web page they read tells them to.
+For sensitive folders, remove the key: the `ask` tool disappears and compression runs on the local model, so no
+cloud model sees your files or chat. Web access is separate: in advisor mode `web_search` sends queries to
+DuckDuckGo (Bing as fallback) and `fetch` downloads whatever URL Qwen picks, key or not. Code mode has no web tools.
 
 ## Configuration
 
@@ -171,7 +187,8 @@ mlx_vlm swaps models when a request names a different one, so keep `QWEN_QUANT` 
 | compression step via DeepSeek | ~1.5–2.5 s |
 | compression step via local Qwen | 1–2 min |
 | research subagent (3 pricing pages) | ~20 s |
-| advisor turn with delegation | 192 s, max prompt 3.4k tok (vs 267 s / 4.8k researching by hand) |
+| 3 parallel `ask`s about this repo (budget, KV cap, env vars) | 5 s wall, all correct with file:line |
+| advisor turn with one research subagent | 192 s, max prompt 3.4k tok (vs 267 s / 4.8k researching by hand) |
 
 ## Tests
 
