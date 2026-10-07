@@ -1375,7 +1375,7 @@ class Agent:
                 msg, fr = self.call_local(tools=True, nudge=nudge)
                 content = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.S).strip()
                 calls = msg.get("tool_calls") or []
-                if nudge is None and not calls and "<function=" in content:
+                if not calls and "<function=" in content:  # tools stay on for nudged steps too
                     calls = parse_xml_calls(content)
                 if "<tool_call>" in content or "<function=" in content:
                     content = re.split(r"<tool_call>|<function=", content)[0].strip()
