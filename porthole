@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""porthole: a small window onto a big, unfiltered mind.
+
+Local uncensored Qwen on Apple Silicon + DeepSeek subagents for the legwork.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(os.path.realpath(__file__)).parent
+sys.path.insert(0, str(ROOT))
+
+VERSION = "0.1.0"
+HF_REPO = "orcarouter/Qwen3.8-27B-Uncensored-MLX"
+MODEL_DIR = ROOT / "Qwen3.8-27B-Uncensored-MLX"
+STATE = ROOT / ".porthole"
+PIDFILE = STATE / "server.pid"
+LOGFILE = STATE / "server.log"
+PY = str(ROOT / ".venv" / "bin" / "python") if (ROOT / ".venv" / "bin" / "python").exists() else sys.executable
+
+# ---------------------------------------------------------------- look
+
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if COLOR else s
+
+
+BRASS, GLASS, DIM, BOLD, RED, GREEN = "38;5;178", "38;5;38", "2", "1", "38;5;203", "38;5;114"
+
+MARK = [  # porthole: brass rim, bolts, a lit glass pane
+    "   ▄▄█▀▀▀█▄▄   ",
+    " ▄█ ●     ● █▄ ",
+    "█▀  ▗▄▄▄▄▄▖  ▀█",
+    "█   ▐░░▒▓▒▌   █",
+    "█▄  ▝▀▀▀▀▀▘  ▄█",
+    " ▀█ ●     ● █▀ ",
+    "   ▀▀█▄▄▄█▀▀   ",
+]
+WORD = [
+    "                                      ",
+    " ___  ___  ___ _____ _  _  ___  _    ___",
+    "| _ \\/ _ \\| _ \\_   _| || |/ _ \\| |  | __|",
+    "|  _/ (_) |   / | | | __ | (_) | |__| _|",
+    "|_|  \\___/|_|_\\ |_| |_||_|\\___/|____|___|",
+    "",
+    "",
+]
+
+
+def paint_mark(line: str) -> str:
+    if not COLOR:
+        return line
+    # glass is sea-teal, bolts pale brass, the rim brass
+    return "".join(c(GLASS, ch) if ch in "░▒▓" else c("38;5;222", ch) if ch == "●"
+                   else c(BRASS, ch) if ch.strip() else ch for ch in line)
+
+
+def banner(tagline: str = "") -> None:
+    tag = tagline or f"uncensored local minds · tiny context, long reach · v{VERSION}"
+    for i, m in enumerate(MARK):
+        w = WORD[i] if i < len(WORD) else ""
+        if i == 5:
+            w = c(DIM, "  " + tag)
+        print(paint_mark(m) + "  " + c(BOLD, w) if i != 5 else paint_mark(m) + w)
+    print()
+
+
+def ok(s): print(f"  {c(GREEN, '●')} {s}")
+def bad(s): print(f"  {c(RED, '●')} {s}")
+def info(s): print(f"  {c(DIM, '·')} {s}")
+
+
+# ---------------------------------------------------------------- server
+
+def env() -> dict:
+    import lowctx  # loads .env
+    return {"url": lowctx.LOCAL_URL, "model": lowctx.DEFAULT_MODEL, "key": bool(lowctx.COMP_KEY),
+            "comp": lowctx.COMP_MODEL}
+
+
+def server_up(url: str | None = None) -> bool:
+    url = url or env()["url"]
+    try:
+        urllib.request.urlopen(url.rstrip("/") + "/models", timeout=2).read()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def server_pid() -> int | None:
+    try:
+        pid = int(PIDFILE.read_text())
+        os.kill(pid, 0)
+        return pid
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def cmd_up(quiet: bool = False) -> int:
+    if server_up():
+        if not quiet:
+            ok("model server already running")
+        return 0
+    quant = os.environ.get("QWEN_QUANT", "4-bit")
+    if not (MODEL_DIR / quant / "config.json").exists():
+        bad(f"no model at {MODEL_DIR / quant}. Run: porthole pull")
+        return 1
+    try:  # the weights need ~16 GB; loading into a swapping Mac makes everything crawl
+        need = sum(f.stat().st_size for f in (MODEL_DIR / quant).glob("*.safetensors"))
+        free = int(mem_free_pct().rstrip("%")) / 100 * int(subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout)
+        if free < need * 1.15:
+            bad(f"only {free / 2**30:.0f} GB free, the model needs ~{need / 2**30:.0f} GB: expect heavy swapping "
+                "and slow answers. Close big apps (VMs, games, DAWs, browsers) first.")
+    except Exception:  # noqa: BLE001
+        pass
+    STATE.mkdir(exist_ok=True)
+    log = open(LOGFILE, "ab")
+    p = subprocess.Popen([str(ROOT / "start-server.sh")], stdout=log, stderr=log,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    PIDFILE.write_text(str(p.pid))
+    frames, t0 = "◐◓◑◒", time.time()
+    tty = sys.stdout.isatty()
+    if not tty:
+        info(f"loading Qwen ({quant}) into memory…")
+    while not server_up():
+        if p.poll() is not None:
+            print()
+            bad(f"server exited (code {p.returncode}); see {LOGFILE}")
+            return 1
+        if time.time() - t0 > 300:
+            print()
+            bad(f"server not ready after 5 min; see {LOGFILE}")
+            return 1
+        if tty:
+            sys.stdout.write(f"\r  {c(BRASS, frames[int(time.time() * 4) % 4])} loading Qwen ({quant}) into memory… "
+                             f"{c(DIM, f'{time.time() - t0:.0f}s')}")
+            sys.stdout.flush()
+        time.sleep(0.25)
+    if tty:
+        sys.stdout.write("\r" + " " * 60 + "\r")
+    ok(f"model server up in {time.time() - t0:.0f}s  {c(DIM, '(porthole down to free the memory)')}")
+    return 0
+
+
+def cmd_down() -> int:
+    pid = server_pid()
+    killed = False
+    if pid:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except Exception:  # noqa: BLE001
+            os.kill(pid, signal.SIGTERM)
+        killed = True
+    # also catch a server started by hand with start-server.sh
+    r = subprocess.run(["pkill", "-f", f"mlx_vlm server --model {MODEL_DIR}"], capture_output=True)
+    killed = killed or r.returncode == 0
+    PIDFILE.unlink(missing_ok=True)
+    for _ in range(40):
+        if not server_up():
+            break
+        time.sleep(0.25)
+    (ok if killed else info)("model server stopped, memory freed" if killed else "no model server was running")
+    return 0
+
+
+def mem_free_pct() -> str:
+    try:
+        out = subprocess.run(["memory_pressure"], capture_output=True, text=True, timeout=5).stdout
+        return out.strip().splitlines()[-1].split(":")[-1].strip()
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def cmd_status() -> int:
+    e = env()
+    banner()
+    (ok if server_up() else bad)(f"model server  {e['url']}  " + ("up" if server_up() else "down  (porthole up)"))
+    quant = os.environ.get("QWEN_QUANT", "4-bit")
+    (ok if (MODEL_DIR / quant).exists() else bad)(f"model         {MODEL_DIR.name}/{quant}")
+    (ok if e["key"] else info)(f"subagents     {e['comp'] + ' via DeepSeek' if e['key'] else 'off (set DEEPSEEK_API_KEY in .env)'}")
+    info(f"free memory   {mem_free_pct()}")
+    return 0
+
+
+def cmd_doctor() -> int:
+    banner("doctor")
+    good = True
+    mac = platform.system() == "Darwin" and platform.machine() == "arm64"
+    (ok if mac else bad)(f"Apple Silicon macOS ({platform.system()} {platform.machine()})")
+    good &= mac
+    try:
+        ram = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout) / 2**30
+        (ok if ram >= 32 else bad)(f"RAM {ram:.0f} GB  {c(DIM, '(4-bit needs ~16 GB + headroom; 32 GB+ recommended)')}")
+    except Exception:  # noqa: BLE001
+        pass
+    has_mlx = subprocess.run([PY, "-c", "import mlx_vlm"], capture_output=True).returncode == 0
+    (ok if has_mlx else bad)(f"mlx-vlm installed ({PY})" if has_mlx else "mlx-vlm missing: run ./install.sh")
+    good &= has_mlx
+    quant = os.environ.get("QWEN_QUANT", "4-bit")
+    have = (MODEL_DIR / quant / "config.json").exists()
+    (ok if have else bad)(f"model weights {MODEL_DIR.name}/{quant}" if have else "model weights missing: porthole pull")
+    good &= have
+    e = env()
+    (ok if e["key"] else info)("DeepSeek key found (subagents on)" if e["key"] else "no DeepSeek key: subagents off, local model summarizes (slow)")
+    for tool, why in (("rg", "faster grep"), ("pdftotext", "read PDFs (brew install poppler)")):
+        (ok if shutil.which(tool) else info)(f"{tool:9} {'found' if shutil.which(tool) else 'optional: ' + why}")
+    (ok if server_up() else info)("model server running" if server_up() else "model server not running (porthole up)")
+    print()
+    return 0 if good else 1
+
+
+def cmd_pull(argv: list) -> int:
+    quant = argv[0] if argv else os.environ.get("QWEN_QUANT", "4-bit")
+    hf = shutil.which("hf") or shutil.which("huggingface-cli")
+    if not hf:
+        cand = ROOT / ".venv" / "bin" / "hf"
+        hf = str(cand) if cand.exists() else None
+    if not hf:
+        bad("Hugging Face CLI not found. Install it: pip install -U huggingface_hub")
+        return 1
+    info(f"downloading {HF_REPO} [{quant}] → {MODEL_DIR}  {c(DIM, '(~15 GB for 4-bit; resumable)')}")
+    return subprocess.call([hf, "download", HF_REPO, "--include", f"{quant}/*", "--local-dir", str(MODEL_DIR)])
+
+
+# ---------------------------------------------------------------- chat
+
+def chat_header(agent) -> None:
+    banner()
+    e = env()
+    sub = f"{e['comp']}" if e["key"] else "off"
+    info(f"mode {c(BOLD, agent.mode)}  ·  cwd {agent.cwd}  ·  budget {agent.budget} tok  ·  subagents {sub}")
+    info('/new  /notes  /mode code|advisor  /help  /quit   ·   paste freely, or wrap long text in """')
+    print()
+
+
+HELP = f"""{c(BOLD, 'usage')}
+  porthole                       chat (advisor mode) in the current folder
+  porthole chat [--mode code|advisor] [first message]
+  porthole run  "task"           one-shot: do the task in this folder, print the result, exit
+                                 (code mode; add --mode advisor for a one-shot opinion)
+  porthole up | down             start / stop the local model server (frees ~16 GB when down)
+  porthole status                server, model, subagents, free memory
+  porthole doctor                check this machine and the install
+  porthole pull [4-bit|6-bit|8-bit]   download Qwen weights from Hugging Face
+
+{c(BOLD, 'chat flags')}  --cwd DIR  --budget TOKENS  --steps N  --think  --no-stream
+{c(BOLD, 'env')}         DEEPSEEK_API_KEY (in .env)  QWEN_QUANT  QWEN_KV  LOWCTX_URL  LOWCTX_MODEL
+"""
+
+
+def ensure_server() -> bool:
+    import lowctx
+    if server_up(lowctx.LOCAL_URL):
+        return True
+    if os.environ.get("LOWCTX_URL"):  # someone else's endpoint: don't try to start ours
+        bad(f"no model server at {lowctx.LOCAL_URL}")
+        return False
+    info("model server not running, starting it")
+    return cmd_up(quiet=True) == 0
+
+
+def cmd_chat(argv: list, one_shot: bool = False) -> int:
+    if not ensure_server():
+        return 1
+    import lowctx
+    if one_shot:
+        if "--mode" not in argv:
+            argv = ["--mode", "code", *argv]
+        argv = ["--once", *argv]
+    lowctx.main(argv, header=None if one_shot else chat_header, prog="porthole chat")
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    cmd = argv[0] if argv and not argv[0].startswith("-") else "chat"
+    rest = argv[1:] if argv and argv[0] == cmd else argv
+    if cmd in ("-h", "--help", "help") or "--help" in argv[:1]:
+        banner()
+        print(HELP)
+        return 0
+    if cmd in ("-v", "--version", "version") or argv[:1] in (["-v"], ["--version"]):
+        print(f"porthole {VERSION}")
+        return 0
+    table = {
+        "chat": lambda: cmd_chat(rest),
+        "run": lambda: cmd_chat(rest, one_shot=True),
+        "up": cmd_up, "down": cmd_down, "status": cmd_status, "doctor": cmd_doctor,
+        "pull": lambda: cmd_pull(rest),
+    }
+    if cmd not in table:  # `porthole what should I do about X` → chat with that as the first message
+        return cmd_chat(argv)
+    return table[cmd]()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

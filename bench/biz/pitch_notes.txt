@@ -1,0 +1,10 @@
+Pitch notes (for angel meeting Nov 12)
+
+- Story: "agencies drown in client feedback emails. TaskPilot fixes that."
+- Traction: MRR grew from $1.2k to $2.9k in 12 months. 28 paying agencies. "Strong organic growth".
+- Churn: we tell people it's "low, mostly agencies that closed down".
+  (Internal: exit survey says 14 of last 30 churned said "missing integrations: Slack, Google Drive, QuickBooks".)
+- Ask: $150k at $1.5M cap to hire a salesperson.
+- Customer quote: "Love the approval links, but we moved back to Trello because of the Slack integration."
+- Roadmap: Slack integration (Q1, maybe), AI task summaries (this was the investor's idea, we don't know if customers want it).
+- Founder worked 70-hour weeks for the last 6 months; support is eating ~50 hours a month.

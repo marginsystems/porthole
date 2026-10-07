@@ -1,0 +1,21 @@
+# allowlist: only the harness is tracked; weights, keys and private files never are
+/*
+!/.gitignore
+!/.env.example
+!/README.md
+!/porthole
+!/lowctx.py
+!/start-server.sh
+!/install.sh
+!/requant.py
+!/requirements.txt
+!/bench/
+/bench/*
+!/bench/probe.py
+!/bench/run_tests.py
+!/bench/t1/
+!/bench/biz/
+.lowctx/
+__pycache__/
+*.pyc
+.DS_Store
