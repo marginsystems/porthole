@@ -18,7 +18,7 @@ PY = ROOT / ".venv/bin/python"
 PY = str(PY if PY.exists() else sys.executable)
 LOGS = ROOT / "bench/logs"
 LOGS.mkdir(exist_ok=True)
-BUDGET = 5000
+BUDGET = 12000
 TIMEOUT = 2400  # seconds per test
 
 

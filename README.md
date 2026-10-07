@@ -24,10 +24,10 @@ Quantized local models run on a laptop, but they degrade quickly once the prompt
 re-reads the whole prompt with no prefix cache, at roughly 100 tokens/s of prefill, so a 16k-token prompt costs
 about 4 minutes *per step*. A normal agent loop of tool calls, file dumps and long chat history kills them.
 
-porthole keeps every step's prompt at about **3–5k tokens** no matter how long the session runs:
+porthole keeps every step's prompt at about **12k tokens** or less no matter how long the session runs:
 
 ```
-            ┌───────────────────────── what Qwen sees each step (~3–5k tok) ─────────────────────────┐
+            ┌───────────────────────── what Qwen sees each step (≤~12k tok) ───────────────────────┐
   you  ───▶ │ short system prompt │ request │ working notes (compressed history) │ last 2 tool steps │ ──▶ Qwen (local)
             └──────────────────────────────────────────────────────────────────────────────────────┘
                                                      ▲                                               │
@@ -147,10 +147,10 @@ For sensitive files, ask Qwen to read them itself and delegate only web research
 | `DEEPSEEK_API_KEY` | none | enables subagents + fast compressor |
 | `DEEPSEEK_MODEL` / `DEEPSEEK_URL` | `deepseek-flash` / `https://api.deepseek.com/v1` | the API accepts `deepseek-flash`, `deepseek-v4-pro` |
 | `QWEN_QUANT` | `4-bit` | which build `porthole up` loads and the harness requests |
-| `QWEN_KV` | `8192` | server context cap in tokens (the harness keeps prompts ~5k) |
+| `QWEN_KV` | `16384` | server context cap in tokens (prompts ≤~12k + up to 1.2k of answer + headroom) |
 | `QWEN_PREFILL` | `512` | prefill chunk; larger chunks ran Metal out of memory on 16k prompts |
 | `LOWCTX_URL` / `LOWCTX_MODEL` / `LOWCTX_KEY` | local mlx server | point porthole at **any OpenAI-compatible model** (LM Studio, llama.cpp, Ollama's `/v1`, vLLM…) |
-| `LOWCTX_BUDGET` | `5000` | target prompt tokens per step (`--budget`) |
+| `LOWCTX_BUDGET` | `12000` | target prompt tokens per step (`--budget`). Lower = faster steps, more compaction |
 | `LOWCTX_STEPS` | `20` | max tool steps per turn (`--steps`) |
 | `LOWCTX_THINK_FIELD=0` | | don't send `enable_thinking` (for servers that reject it) |
 

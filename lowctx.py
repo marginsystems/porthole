@@ -13,7 +13,7 @@ Everything else lives outside the prompt:
   * file reads are paged (line numbers + ranges) instead of dumped whole
 
 Modes: advisor (default; blunt business/strategy/code advisor) and code (coding agent).
-Stdlib only.   Usage:  lowctx.py [--mode advisor|code] [--cwd DIR] [--budget 5000] ["first message"]
+Stdlib only.   Usage:  lowctx.py [--mode advisor|code] [--cwd DIR] [--budget 12000] ["first message"]
 """
 
 from __future__ import annotations
@@ -1163,8 +1163,8 @@ def main(argv: list | None = None, header=None, prog: str | None = None) -> None
     ap.add_argument("task", nargs="*", help="optional first message")
     ap.add_argument("--cwd", default=os.getcwd())
     ap.add_argument("--mode", choices=["advisor", "code"], default=os.environ.get("LOWCTX_MODE", "advisor"))
-    ap.add_argument("--budget", type=int, default=int(os.environ.get("LOWCTX_BUDGET", "5000")),
-                    help="target prompt tokens for the local model (default 5000)")
+    ap.add_argument("--budget", type=int, default=int(os.environ.get("LOWCTX_BUDGET", "12000")),
+                    help="target prompt tokens for the local model (default 12000)")
     ap.add_argument("--steps", type=int, default=int(os.environ.get("LOWCTX_STEPS", "20")), help="max tool steps per turn")
     ap.add_argument("--url", help="OpenAI-compatible base URL (env LOWCTX_URL)")
     ap.add_argument("--model", help="model id (env LOWCTX_MODEL; default autodetect)")
