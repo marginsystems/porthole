@@ -116,10 +116,17 @@ MODE_TOOLS = {
 }
 
 
-def schemas(mode: str) -> list:
+# Lookups a subagent does for Qwen in advisor mode. Prompting alone didn't stop the local model from doing them by
+# hand, so with a key they're simply not offered until an ask declines or fails (then the turn gets them back).
+ADVISOR_DELEGATED = ("web_search", "fetch", "grep")
+
+
+def schemas(mode: str, direct: bool = False) -> list:
     names = MODE_TOOLS[mode]
     if not COMP_KEY:
         return schemas_for([n for n in names if n != "ask"])
+    if mode == "advisor" and not direct:
+        names = [n for n in names if n not in ADVISOR_DELEGATED]
     # list ask first so the small model reaches for it before reading things by hand
     return schemas_for(["ask"] + [n for n in names if n != "ask"])
 
@@ -934,8 +941,13 @@ class SubagentBoard:
 
     def __init__(self, questions: list[str], quiet: bool = False):
         import threading
-        self.rows = [{"q": re.sub(r"[\x00-\x1f\x7f-\x9f]", "", q), "act": "dispatching",
-                      "t0": time.time(), "t1": None, "ok": None} for q in questions]
+        qs = [re.sub(r"[\x00-\x1f\x7f-\x9f]", "", q) for q in questions]
+        if len(qs) > 1:  # parallel asks often share a long lead-in; show the part that differs
+            common = os.path.commonprefix(qs)
+            cut = common.rfind(" ")
+            if cut >= 15 and all(len(q) > cut + 1 for q in qs):
+                qs = ["…" + q[cut + 1:] for q in qs]
+        self.rows = [{"q": q, "act": "dispatching", "t0": time.time(), "t1": None, "ok": None} for q in qs]
         self.live = _TTY and not quiet
         self.quiet = quiet
         self.lock = threading.Lock()
@@ -1034,6 +1046,7 @@ class Agent:
                  stream: bool = True, quiet: bool = False):
         self.cwd, self.budget, self.max_steps, self.think = cwd, budget, max_steps, think
         self.mode, self.stream, self.quiet = mode, stream, quiet
+        self.direct = False
         self.store = cwd / ".lowctx"
         self.store.mkdir(exist_ok=True)
         self.tools = Tools(cwd, self.store)
@@ -1089,7 +1102,7 @@ class Agent:
         return [self.system(), *self.live]
 
     def est(self, msgs: list) -> int:
-        chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in msgs) + len(json.dumps(schemas(self.mode)))
+        chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in msgs) + len(json.dumps(schemas(self.mode, self.direct)))
         return int(chars / self.chars_per_token)
 
     def sanitize(self) -> None:
@@ -1257,7 +1270,7 @@ class Agent:
                     "max_tokens": 2048 if self.think else (1200 if self.mode == "advisor" else 1024),
                     "temperature": 0.3 if self.mode == "advisor" else 0.2}
             if tools:
-                body["tools"] = schemas(self.mode)
+                body["tools"] = schemas(self.mode, self.direct)
             if THINK_FIELD:
                 body["enable_thinking"] = self.think
             t = time.time()
@@ -1278,7 +1291,7 @@ class Agent:
         u = d.get("usage") or {}
         pt = u.get("prompt_tokens")
         if pt:
-            chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in msgs) + (len(json.dumps(schemas(self.mode))) if tools else 0)
+            chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in msgs) + (len(json.dumps(schemas(self.mode, self.direct))) if tools else 0)
             self.chars_per_token = max(1.5, 0.7 * self.chars_per_token + 0.3 * (chars / pt))
             self.stats["prompt_tokens"].append(pt)
             self.turn_pts.append(pt)
@@ -1339,12 +1352,16 @@ class Agent:
                 ok, text = f.result()
                 board.done(i, ok, text)
                 res[cid] = text
+                if not ok and not self.direct:  # "find it yourself" must be possible: hand the tools back
+                    self.direct = True
+                    self.log("  [a subagent declined or failed; direct web_search/fetch/grep enabled for this turn]")
         self.stats["asks"] = self.stats.get("asks", 0) + len(jobs)
         return res
 
     def run(self, request: str) -> str:
         """One user turn. Returns the final answer (already printed live if self.streamed)."""
         self.turn_pts, self.streamed = [], False
+        self.direct = False  # direct web/grep tools come back only if an ask declines or fails this turn
         t0, steps0, comp0 = time.time(), self.stats["steps"], self.stats["compactions"]
         text = self.prepare_user(request)
         self.goal = text

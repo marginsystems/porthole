@@ -241,7 +241,7 @@ def chat_header(agent) -> None:
     banner()
     e = env()
     sub = f"{e['comp']}" if e["key"] else "off"
-    info(f"mode {c(BOLD, agent.mode)}  ·  cwd {agent.cwd}  ·  budget {agent.budget} tok  ·  subagents {sub}")
+    info(f"mode {c(BOLD, agent.mode)}  ·  {agent.cwd}  ·  budget {agent.budget // 1000}k tok  ·  subagents {sub}")
     info('/new  /notes  /mode code|advisor  /help  /quit   ·   paste freely, or wrap long text in """')
     print()
 
