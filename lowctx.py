@@ -19,7 +19,6 @@ Stdlib only.   Usage:  lowctx.py [--mode advisor|code] [--cwd DIR] [--budget 120
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import html
 import json
@@ -35,6 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -508,9 +508,11 @@ def http_get(url: str, data: bytes | None = None, timeout: int = 25, max_bytes: 
     with opener.open(req, timeout=timeout) as r:
         raw = r.read(max_bytes)
         if r.headers.get("Content-Encoding") == "gzip":
+            # max_bytes bounds what we read, not what it expands to: a few MB of gzip can inflate to gigabytes.
+            # Stream-decompress and stop at max_bytes of output.
             try:
-                raw = gzip.decompress(raw)
-            except Exception:  # noqa: BLE001
+                raw = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw, max_bytes)
+            except zlib.error:
                 pass
         return raw, r.headers.get("Content-Type", ""), r.geturl()
 
