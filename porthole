@@ -90,6 +90,21 @@ def env() -> dict:
             "comp": lowctx.COMP_MODEL}
 
 
+def weights_missing(quant: str) -> str | None:
+    """What's missing from a model build, or None if it's complete. A half-finished pull has
+    config.json but not every weight shard, so check the shards the index lists."""
+    d = MODEL_DIR / quant
+    try:
+        idx = json.loads((d / "model.safetensors.index.json").read_text())
+    except (OSError, ValueError):
+        return "no model at all" if not (d / "config.json").exists() else "the weight index"
+    shards = sorted(set(idx.get("weight_map", {}).values()))
+    gone = [f for f in shards if not (d / f).is_file() or (d / f).stat().st_size == 0]
+    if not (d / "config.json").exists():
+        gone.insert(0, "config.json")
+    return f"{len(gone)} of {len(shards)} weight files (download incomplete)" if gone else None
+
+
 def server_up(url: str | None = None) -> bool:
     url = url or env()["url"]
     try:
@@ -114,8 +129,9 @@ def cmd_up(quiet: bool = False) -> int:
             ok("model server already running")
         return 0
     quant = os.environ.get("QWEN_QUANT", "4-bit")
-    if not (MODEL_DIR / quant / "config.json").exists():
-        bad(f"no model at {MODEL_DIR / quant}. Run: porthole pull")
+    missing = weights_missing(quant)
+    if missing:
+        bad(f"{MODEL_DIR / quant} is missing {missing}. Run: porthole pull{'' if quant == '4-bit' else ' ' + quant}")
         return 1
     try:  # the weights need ~16 GB; loading into a swapping Mac makes everything crawl
         need = sum(f.stat().st_size for f in (MODEL_DIR / quant).glob("*.safetensors"))
@@ -210,8 +226,10 @@ def cmd_doctor() -> int:
     (ok if has_mlx else bad)(f"mlx-vlm installed ({PY})" if has_mlx else "mlx-vlm missing: run ./install.sh")
     good &= has_mlx
     quant = os.environ.get("QWEN_QUANT", "4-bit")
-    have = (MODEL_DIR / quant / "config.json").exists()
-    (ok if have else bad)(f"model weights {MODEL_DIR.name}/{quant}" if have else "model weights missing: porthole pull")
+    missing = weights_missing(quant)
+    have = missing is None
+    (ok if have else bad)(f"model weights {MODEL_DIR.name}/{quant}" if have
+                          else f"model weights: missing {missing}. Run: porthole pull")
     good &= have
     e = env()
     (ok if e["key"] else info)("DeepSeek key found (subagents on)" if e["key"] else "no DeepSeek key: subagents off, local model summarizes (slow)")

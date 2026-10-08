@@ -4,6 +4,7 @@
 !/.env.example
 !/README.md
 !/LICENSE
+!/docs/
 !/porthole
 !/lowctx.py
 !/start-server.sh

@@ -10,6 +10,11 @@
    ▀▀█▄▄▄█▀▀
 ```
 
+<p align="center">
+  <img src="docs/demo.gif" alt="porthole: Qwen dispatches three parallel DeepSeek subagents (two read the startup's files, one checks Trello's pricing), then roasts the business" width="860">
+  <br><sub>Real session, sped up 1.4×: three subagents run in parallel, then local Qwen writes the verdict.</sub>
+</p>
+
 **A small window onto a big, unfiltered mind.** porthole is an agent harness for running an uncensored
 27B Qwen *locally* on a Mac. It gives the model a small context window to work in, and cloud subagents
 for the legwork, so it can read your files, search the web, run commands and fix code across long sessions
