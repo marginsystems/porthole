@@ -118,11 +118,16 @@ work. What you do with it is on you. Read the model card.
 | `porthole doctor` | checks the machine and the install |
 | `porthole pull [quant]` | downloads weights from Hugging Face |
 
+One session per folder: run `porthole` again in the same folder and it picks up the notes and recent turns
+from last time (`.lowctx/session.json`). `porthole --new` or `/new` starts fresh; `porthole run` one-shots
+leave the session alone.
+
 In chat: `/new` clears the conversation, `/notes` shows the compressed memory, `/mode code|advisor` switches
 mode, `/quit` exits. Paste freely; multi-line pastes are joined, or wrap long text in `"""`. Huge pastes are
 saved to `.lowctx/` and replaced by a brief, and the model can still read the original.
 
-Scratch data (saved pages, big outputs, `transcript.jsonl`) goes to `./.lowctx/` in the folder you chat from.
+Scratch data (the session, saved pages, big outputs, `transcript.jsonl`) goes to `./.lowctx/` in the folder you
+chat from; it carries its own `.gitignore` so none of it gets committed.
 
 ## Use cases
 
