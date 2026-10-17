@@ -7,7 +7,8 @@ The local model (any OpenAI-compatible endpoint) only ever sees a small, rebuilt
 
 Everything else lives outside the prompt:
   * older turns / exchanges are folded into "notes" by a compressor model
-    (DeepSeek when DEEPSEEK_API_KEY is set, otherwise the local model itself)
+    (a helper model on any OpenAI-compatible endpoint when HELPER_URL / HELPER_KEY is set, otherwise the
+    local model itself)
   * big tool outputs / web pages are saved to .lowctx/ and replaced by a question-focused digest
   * huge user pastes are saved to disk and replaced by a brief
   * file reads are paged (line numbers + ranges) instead of dumped whole
@@ -58,9 +59,31 @@ LOCAL_MODEL = os.environ.get("LOWCTX_MODEL", "")  # empty -> autodetect from /mo
 LOCAL_KEY = os.environ.get("LOWCTX_KEY", "")
 THINK_FIELD = os.environ.get("LOWCTX_THINK_FIELD", "1") != "0"  # send enable_thinking at all?
 
-COMP_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-COMP_URL = os.environ.get("DEEPSEEK_URL", "https://api.deepseek.com/v1")
-COMP_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
+# the helper model (subagents + compressor): any OpenAI-compatible endpoint. DEEPSEEK_* are the older names.
+COMP_URL = os.environ.get("HELPER_URL") or os.environ.get("DEEPSEEK_URL", "https://api.deepseek.com/v1")
+_comp_host = (urllib.parse.urlparse(COMP_URL).hostname or "").lower()
+# the older DEEPSEEK_API_KEY is only sent to a DeepSeek host, never to another HELPER_URL
+COMP_KEY = os.environ.get("HELPER_KEY") or (
+    os.environ.get("DEEPSEEK_API_KEY", "") if _comp_host == "deepseek.com" or _comp_host.endswith(".deepseek.com") else "")
+COMP_MODEL = os.environ.get("HELPER_MODEL") or os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
+
+
+def helper_on(key: str, url: str) -> bool:
+    """A helper is configured: a key is set, or HELPER_URL is set explicitly (a keyless local server counts)."""
+    return bool(key or url)
+
+
+HELPER_ON = helper_on(COMP_KEY, os.environ.get("HELPER_URL", ""))
+HELPER_EXTRA_ERR = ""  # why HELPER_EXTRA_BODY was ignored, if it was (porthole doctor reports it too)
+try:  # JSON object merged into every helper request, e.g. another provider's reasoning switch
+    HELPER_EXTRA_BODY = json.loads(os.environ.get("HELPER_EXTRA_BODY") or "{}")
+    if not isinstance(HELPER_EXTRA_BODY, dict):
+        raise ValueError(f"must be a JSON object, got {type(HELPER_EXTRA_BODY).__name__}")
+except ValueError as _e:  # json.JSONDecodeError is a ValueError
+    HELPER_EXTRA_BODY, HELPER_EXTRA_ERR = {}, str(_e)[:120]
+    # silently dropping it would leave a reasoning model thinking until max_tokens and returning nothing
+    print(f"[warning: HELPER_EXTRA_BODY ignored, {HELPER_EXTRA_ERR}; it must be a JSON object such as "
+          '{"reasoning": {"effort": "low"}}]', file=sys.stderr)
 
 BASH_TIMEOUT = int(os.environ.get("LOWCTX_BASH_TIMEOUT", "120"))
 READ_LINES = 150  # max lines per read call
@@ -132,7 +155,7 @@ ADVISOR_DELEGATED = ("web_search", "fetch", "grep")
 
 def schemas(mode: str, direct: bool = False) -> list:
     names = MODE_TOOLS[mode]
-    if not COMP_KEY:
+    if not HELPER_ON:
         return schemas_for([n for n in names if n != "ask"])
     if mode == "advisor" and not direct:
         names = [n for n in names if n not in ADVISOR_DELEGATED]
@@ -181,6 +204,43 @@ Drop repetition and filler. Under {words} words. Output only the condensed messa
 MESSAGE:
 {text}"""
 
+PASTE_BRIEF_PROMPT = """The user pasted the text below into a chat. Their own words around it (context only; the
+assistant sees them verbatim): "{context}"
+Brief the PASTED TEXT for an AI assistant with a tiny context window. Say what kind of text it is and how it is laid
+out. Keep every concrete fact, requirement, name, number, date, error and short snippet verbatim, most of all what the
+user's words ask about. Drop repetition and filler. Under {words} words. Output only the brief.
+
+PASTED TEXT{part}:
+{text}"""
+
+MERGE_PROMPT = """These are briefs of consecutive parts of one long text, in order. Merge them into one brief of the
+whole text. Keep every concrete fact, name, number, date and verbatim snippet; drop repetition.
+Under {words} words. Output only the brief.
+
+{text}"""
+
+BRIEF_PART = 12_000  # chars per part when the local compressor (14k chars max) briefs a longer text
+BRIEF_MAX_PARTS = 10  # ~1-2 min each on the local model; the rest of the text is only in the saved file
+
+
+def brief_words(n: int) -> int:
+    """Brief length for an n-char text: 300 words up to 12k chars, growing to 600 for ~48k chars and up."""
+    return int(min(600, 300 * max(1.0, n / 12_000) ** 0.5))
+
+
+def split_parts(text: str, size: int) -> list[str]:
+    """Cut text into pieces of at most `size` chars, at line ends where possible."""
+    parts, cur = [], ""
+    for line in text.splitlines(keepends=True):
+        if len(cur) + len(line) > size and cur:
+            parts.append(cur)
+            cur = ""
+        while len(line) > size:
+            parts.append(line[:size])
+            line = line[size:]
+        cur += line
+    return parts + [cur] if cur else parts
+
 
 # ---------------------------------------------------------------- llm clients
 
@@ -213,6 +273,33 @@ def post_chat(url: str, key: str, body: dict, timeout: int = 1800) -> dict:
                 continue
             raise HTTPFail(0, f"cannot reach {url}: {e}") from e
     raise HTTPFail(0, "unreachable")
+
+
+def helper_body(body: dict, url: str | None = None, extra: dict | None = None) -> dict:
+    """body plus the helper provider's switches. Reasoning models spend max_tokens thinking and return "" unless
+    told not to, but each provider names the switch differently and OpenAI-style APIs reject unknown fields."""
+    url = COMP_URL if url is None else url
+    extra = HELPER_EXTRA_BODY if extra is None else extra
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    out = dict(body)
+    if host == "deepseek.com" or host.endswith(".deepseek.com"):
+        out["thinking"] = {"type": "disabled"}
+    elif host in ("localhost", "127.0.0.1", "::1"):  # mlx_vlm / vLLM-style local servers
+        out["enable_thinking"] = False
+    out.update(extra)
+    return out
+
+
+def helper_post(body: dict, timeout: int = 180) -> dict:
+    """post_chat to the helper model; once more without the provider extras if the server rejects a field."""
+    full = helper_body(body)
+    try:
+        return post_chat(COMP_URL, COMP_KEY, full, timeout=timeout)
+    except HTTPFail as e:
+        if e.code != 400 or full == body or not re.search(
+                r"unknown|unrecogni[sz]ed|unexpected|not permitted|unsupported", str(e), re.I):
+            raise
+        return post_chat(COMP_URL, COMP_KEY, body, timeout=timeout)
 
 
 def stream_chat(url: str, key: str, body: dict, on_text, timeout: int = 1800) -> dict:
@@ -326,7 +413,7 @@ class Compressor:
 
     def __init__(self, log, local_model):
         self.log, self.local_model = log, local_model
-        self.use_remote = bool(COMP_KEY)
+        self.use_remote = HELPER_ON
         self.name = COMP_MODEL if self.use_remote else "local"
 
     @property
@@ -337,14 +424,11 @@ class Compressor:
         url, key, model = (COMP_URL, COMP_KEY, COMP_MODEL) if remote else (LOCAL_URL, LOCAL_KEY, self.local_model())
         body = {"model": model, "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": int(words * 2.2) + 64, "temperature": 0.1}
-        if remote:
-            # deepseek-flash is a reasoning model; without this it spends max_tokens thinking and returns ""
-            body["thinking"] = {"type": "disabled"}
-        elif THINK_FIELD:
+        if not remote and THINK_FIELD:
             body["enable_thinking"] = False
         # local calls stream: if Ctrl+C drops the connection the server stops generating, instead of finishing
         # a summary nobody reads while the next message queues behind it
-        d = (post_chat(url, key, body, timeout=180) if remote
+        d = (helper_post(body, timeout=180) if remote
              else stream_chat(url, key, body, lambda s: None, timeout=1800))
         out = (d["choices"][0]["message"].get("content") or "").strip()
         return re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
@@ -360,9 +444,9 @@ class Compressor:
             except Exception as e:  # noqa: BLE001
                 self.log(f"  [compressor {COMP_MODEL} failed ({str(e)[:80]}); using local model]")
                 via = "local(fallback)"
-                if len(prompt) > 14_000:
-                    prompt = focus(prompt, goal, 14_000)
-        if not out:
+        if not out:  # the local model takes 14k chars whether the remote call failed or returned an empty reply
+            if len(prompt) > 14_000:
+                prompt = focus(prompt, goal, 14_000)
             out = self._call(False, prompt, words)
         self.log(f"  [compress via {via}: {len(prompt)}→{len(out)} chars, {time.time()-t:.1f}s]")
         return out
@@ -818,7 +902,7 @@ class Tools:
 # ---------------------------------------------------------------- subagents (cloud workers)
 #
 # Qwen holds the big picture. When it needs a fact (a value in a file, where something is used, a price on a
-# web page) it calls ask(question). Each ask is an independent DeepSeek worker with read-only tools that never
+# web page) it calls ask(question). Each ask is an independent helper-model worker with read-only tools that never
 # sees the user's request: it answers exactly the question it was given and reports evidence. Several asks in
 # one step run in parallel.
 
@@ -844,12 +928,22 @@ REFUSAL = re.compile(
     r"cannot (?:help|assist|comply) with|against (?:my|the) (?:policy|policies|guidelines)|not appropriate for me)",
     re.I)
 SUB_FALLBACK = "Find it yourself with read/grep/web_search."
-# Worker results go to DeepSeek, and a file or page the worker reads can carry prompt injection. So workers only
+# a provider's moderation/refusal error body (DeepSeek, OpenAI/Azure content policy, OpenRouter flagged input, ...)
+MODERATION = re.compile(r"content exists risk|content[_ ]policy|content management policy|moderation|safety|flagged",
+                        re.I)
+# Worker results go to the helper model, and a file or page the worker reads can carry prompt injection. So workers only
 # see files under the working dir, and never credential-looking files, whatever path they are told to open.
 SECRET = re.compile(r"(^|/)(\.env(\..*)?|\.netrc|\.npmrc|\.pypirc|\.git-credentials|id_(rsa|dsa|ecdsa|ed25519)[^/]*|"
                     r"[^/]*\.(pem|key|p12|pfx|keystore|jks)|credentials(?:[^/]*|/.*)|secrets?\.[^/]*)$"
                     # .lowctx holds saved pastes, tool output and the transcript: the user's session, not repo data
                     r"|(^|/)\.(ssh|aws|gnupg|kube|docker|config/gh|lowctx|git)(/|$)", re.I)
+# ...except the user's saved pastes (single files): the lead can only point an ask at a long paste if a worker may
+# open it. session.json, notes.md, transcript.jsonl and out-*/page-* stay blocked: they hold the whole session.
+# No ':' in the name, so a grep line's 'path:N:' prefix can't be faked by a file name.
+SAVED_PASTE = re.compile(r"^\.lowctx/input-[\w-]+\.txt$")
+# first line of every file save_input writes: a file under that name without it (a hard link to .env whose
+# original name was removed, a file put there by hand) is not a saved paste, whatever its link count says
+PASTE_MARK = "[porthole: text the user pasted into the chat, saved whole; line 1 is this marker]\n"
 
 
 def worker_blocked(tools: "Tools", name: str, args: dict) -> str | None:
@@ -860,11 +954,33 @@ def worker_blocked(tools: "Tools", name: str, args: dict) -> str | None:
     root = tools.cwd.resolve()
     if target != root and root not in target.parents:
         return f"error: {args.get('path')} is outside the working directory ({root}); workers can only look inside it"
-    rel = target.relative_to(root).as_posix()
-    if rel != "." and SECRET.search(rel):
+    rel = target.relative_to(root).as_posix()  # symlinks already resolved: a paste name linking to .env is .env
+    if rel != "." and SECRET.search(rel) and not is_saved_paste(tools, args.get("path")):
         return (f"error: {args.get('path')} is off limits to workers (credentials, or porthole's own session data "
                 "in .lowctx/)")
     return None
+
+
+def is_saved_paste(tools: "Tools", path) -> bool:
+    """A file prepare_user saved under .lowctx/input-*.txt. resolve() follows symlinks but a hard link is the same
+    inode under a second name: a link from .env or session.json to a saved-paste name has st_nlink > 1, so it
+    (and the file it links) stay off limits."""
+    target, root = tools.path(str(path or ".")), tools.cwd.resolve()
+    if root not in target.parents or not SAVED_PASTE.match(target.relative_to(root).as_posix()):
+        return False
+    try:  # O_NOFOLLOW|O_NONBLOCK: never a symlink, never blocking on a FIFO; then judge the opened fd, not the name
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:  # a directory opens fine but is no paste
+            return False
+        return os.read(fd, len(PASTE_MARK.encode())) == PASTE_MARK.encode()
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
 
 
 def _line_paths(line: str) -> list[str]:
@@ -876,26 +992,30 @@ def _line_paths(line: str) -> list[str]:
 
 
 def worker_filter(out: str) -> str:
-    """Drop grep/ls lines that point at secret files (grep over '.' would otherwise print .env contents)."""
-    keep = [l for l in out.splitlines() if not any(SECRET.search(c) for c in _line_paths(l))]
+    """Drop grep/ls lines that point at secret files (grep over '.' would otherwise print .env contents).
+    A grep line from a saved paste ('.lowctx/input-…txt:N:text') stays."""
+    def ok(l: str) -> bool:
+        if any(SAVED_PASTE.match(l[:m.start()]) for m in re.finditer(r":\d+:", l)):
+            return True
+        return not any(SECRET.search(c) for c in _line_paths(l))
+    keep = [l for l in out.splitlines() if ok(l)]
     return "\n".join(keep) if keep else "no matches"
 
 
 def ask_subagent(question: str, hints: str, tools: "Tools", progress=lambda s: None) -> tuple[bool, str]:
-    """Run one DeepSeek worker on a narrow question. Returns (ok, text for the lead)."""
-    if not COMP_KEY:
-        return False, f"[ask unavailable: no DEEPSEEK_API_KEY] {SUB_FALLBACK}"
+    """Run one helper-model worker on a narrow question. Returns (ok, text for the lead)."""
+    if not HELPER_ON:
+        return False, f"[ask unavailable: no helper model (set HELPER_URL / HELPER_KEY)] {SUB_FALLBACK}"
     task = str(question).strip() + (f"\nWhere to look: {hints}" if str(hints or "").strip() else "")
     msgs = [{"role": "system", "content": SUB_SYSTEM.format(cwd=tools.cwd, steps=SUB_STEPS)},
             {"role": "user", "content": task}]
     sub_schemas = schemas_for(SUB_TOOLS)
 
     def ask(with_tools: bool) -> dict:
-        body = {"model": COMP_MODEL, "messages": msgs, "max_tokens": 900, "temperature": 0.1,
-                "thinking": {"type": "disabled"}}
+        body = {"model": COMP_MODEL, "messages": msgs, "max_tokens": 900, "temperature": 0.1}
         if with_tools:
             body["tools"] = sub_schemas
-        return post_chat(COMP_URL, COMP_KEY, body, timeout=180)["choices"][0]
+        return helper_post(body, timeout=180)["choices"][0]
 
     used = 0  # tool calls executed so far; SUB_STEPS caps the total, not the number of rounds
     try:
@@ -931,7 +1051,9 @@ def ask_subagent(question: str, hints: str, tools: "Tools", progress=lambda s: N
                         args = {**args, "public_only": True}
                     out = worker_blocked(tools, name, args) or (
                         tools.read_full(**args) if name == "read" else tools.run(name, args))
-                    if name in ("grep", "ls") and not out.startswith("error"):
+                    # grep on one saved paste prints bare 'N:text' lines, all from that (allowed) file
+                    if name in ("grep", "ls") and not out.startswith("error") and not (
+                            name == "grep" and is_saved_paste(tools, args.get("path"))):
                         out = worker_filter(out)
                 msgs.append({"role": "tool", "tool_call_id": c.get("id") or name, "content": clip(out, SUB_RESULT_CHARS)})
             for c in calls[len(run_now):]:  # every tool_call id needs a reply
@@ -945,7 +1067,7 @@ def ask_subagent(question: str, hints: str, tools: "Tools", progress=lambda s: N
         return False, f"[ask gave no answer] {SUB_FALLBACK}"
     except HTTPFail as e:
         txt = str(e)
-        if "Content Exists Risk" in txt or ("content" in txt.lower() and "risk" in txt.lower()):
+        if e.code in (400, 403) and MODERATION.search(txt) or "Content Exists Risk" in txt:
             return False, f"[ask declined: provider moderation] {SUB_FALLBACK}"
         return False, f"[ask unavailable: {txt[:150]}] {SUB_FALLBACK}"
     except Exception as e:  # noqa: BLE001
@@ -1189,22 +1311,30 @@ class Agent:
 
     def reset(self) -> None:
         self.goal, self.notes, self.live, self.session_turns = "", "", [], 0
-        try:
-            self.session_file.unlink(missing_ok=True)
-        except OSError as e:  # e.g. a repo-supplied directory here: leave its contents alone and start fresh
-            self.log(f"  [could not clear {self.session_file.relative_to(self.cwd)} ({e})]")
+        for f in (self.session_file, self.notes_file):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError as e:  # e.g. a repo-supplied directory here: leave its contents alone and start fresh
+                self.log(f"  [could not clear {f.relative_to(self.cwd)} ({e})]")
 
     # -- session: one per folder, so a restart picks up where the last chat left off
     @property
     def session_file(self) -> Path:
         return self.store / "session.json"
 
+    @property
+    def notes_file(self) -> Path:  # a readable copy of the notes; never read back
+        return self.store / "notes.md"
+
     def save_session(self) -> None:
         data = {"version": SESSION_VERSION, "saved": time.time(), "notes": self.notes, "live": self.live,
-                "n_out": self.n_out, "turns": self.session_turns}
-        tmp = self.session_file.with_name(f"session.{uuid.uuid4().hex[:8]}.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False))
-        os.replace(tmp, self.session_file)  # never leave a half-written session behind
+                "n_out": self.n_out, "turns": self.session_turns, "mode": self.mode}
+        md = (f"# porthole notes for {self.cwd} ({time.strftime('%Y-%m-%d %H:%M')}, {self.mode} mode; "
+              f"a copy of session.json, edits here are not read back)\n\n{self.notes or '(no notes yet)'}\n")
+        for f, body in ((self.session_file, json.dumps(data, ensure_ascii=False)), (self.notes_file, md)):
+            tmp = f.with_name(f"{f.stem}.{uuid.uuid4().hex[:8]}.tmp")
+            tmp.write_text(body)
+            os.replace(tmp, f)  # never leave a half-written file behind, and never write through a planted symlink
 
     def read_session_bytes(self) -> bytes:
         """At most SESSION_MAX_BYTES + 1 bytes, and only from a regular file: opening a FIFO for reading blocks
@@ -1216,8 +1346,9 @@ class Agent:
                 raise OSError("not a regular file")
             return fh.read(SESSION_MAX_BYTES + 1)
 
-    def load_session(self) -> dict | None:
-        """Restore the saved notes and recent turns. Returns the saved data, or None when there's nothing usable."""
+    def load_session(self, restore_mode: bool = True) -> dict | None:
+        """Restore the saved notes and recent turns, and the mode unless restore_mode is False (--mode given).
+        Returns the saved data, or None when there are no notes or turns to resume (the mode may still be restored)."""
         try:
             raw = self.read_session_bytes()
             if len(raw) > SESSION_MAX_BYTES:
@@ -1243,6 +1374,8 @@ class Agent:
                 raise ValueError(f"n_out {n_out} out of range")
             turns = int(data.get("turns") or 0)
             float(data.get("saved") or 0)
+            # older sessions have no mode, and an unknown one is ignored: either way keep the current mode
+            mode = data.get("mode") if data.get("mode") in ("advisor", "code") else None
             self.live = live
             self.sanitize()
         except (TypeError, ValueError, KeyError, AttributeError, OverflowError) as e:
@@ -1252,6 +1385,8 @@ class Agent:
         self.notes = notes
         self.n_out = max(self.n_out, n_out)  # don't overwrite out-N files old notes point at
         self.session_turns = turns
+        if mode and restore_mode:
+            self.set_mode(mode)
         return data if (self.notes or self.live) else None
 
     # -- prompt assembly
@@ -1395,7 +1530,7 @@ class Agent:
         if name == "read":
             return clip(out, limit)
         call = f"{name} {json.dumps({k: v for k, v in args.items() if k != 'purpose'}, ensure_ascii=False)[:300]}"
-        # the caller's own words, never the user's request: DeepSeek doesn't need to understand the task
+        # the caller's own words, never the user's request: the helper model doesn't need to understand the task
         purpose = (str(args.get("purpose") or "").strip() or intent.strip()[:600]
                    or "not stated: keep the most informative lines")
         self.busy(f"digesting {len(out):,} chars of {name} output")
@@ -1408,21 +1543,89 @@ class Agent:
         head = out.splitlines()[0] if name in ("bash", "fetch") else ""
         return (f"{head}\n[digest of {len(out)} chars; full text saved to {rel} — use grep on that file for specific terms; do not page through it]\n{digest}")[:MSG_CAP]
 
+    def save_input(self, text: str) -> str:
+        """Save a long message or paste to .lowctx/input-*.txt (workers may read these); returns its relative path."""
+        self.n_out += 1
+        f = self.store / f"input-{int(time.time())}-{self.n_out}.txt"
+        f.write_text(PASTE_MARK + text)
+        return f.relative_to(self.cwd).as_posix()
+
+    def lookup_hint(self, rel: str) -> str:
+        """How the model gets details out of a saved paste (ask exists only with a key)."""
+        name = rel.rsplit("/", 1)[-1]
+        how = f"read {rel} with start= to page through it, or grep it"
+        return (f"ask a subagent, e.g. ask('what does {name} say about …', hints='{rel}'), or " + how) if HELPER_ON else how
+
+    def brief_long(self, text: str, words: int, template: str, goal: str = "", **fmt) -> str:
+        """Brief `text` with `template` ({words}, {text}, plus fmt). The local compressor takes 14k chars and
+        Compressor.run would keep only focus()'s keyword-matching lines of a longer text, so then brief it in
+        ~12k-char parts, in order, and merge the part briefs with one more call."""
+        whole = template.format(words=words, text=text, **fmt)
+        if self.comp.use_remote or len(whole) <= self.comp.max_in:
+            return self.comp.run(whole, words, goal=goal)
+        parts = split_parts(text, BRIEF_PART)
+        done = parts[:BRIEF_MAX_PARTS]
+        per = max(120, min(words, 1500 // len(done)))  # all part briefs together must fit the merge call
+        briefs = []
+        for i, part in enumerate(done, 1):
+            self.busy(f"condensing a long paste: part {i}/{len(done)}")
+            prompt = template.format(words=per, text=part, **{**fmt, "part": f" (part {i} of {len(done)})"})
+            briefs.append(f"[part {i}/{len(done)}]\n" + self.comp.run(prompt, per, goal=goal))
+        self.busy("merging the briefs")
+        out = self.comp.run(MERGE_PROMPT.format(words=words, text="\n\n".join(briefs)), words, goal=goal)
+        if len(parts) > len(done):
+            n = sum(map(len, done))
+            out += f"\n[only the first {n:,} of {len(text):,} chars were briefed; the rest is only in the saved file]"
+        return out
+
     def prepare_user(self, text: str) -> str:
-        if len(text) / self.chars_per_token > self.budget * 0.3:
-            self.n_out += 1
-            f = self.store / f"input-{int(time.time())}-{self.n_out}.txt"
-            f.write_text(text)
-            self.log(f"  [large message ({len(text)} chars) saved to {f.relative_to(self.cwd)}; briefing it]")
-            self.busy("condensing your long message")
+        """A message over ~30% of the budget is saved to .lowctx/ and briefed. When the prompt knows which parts were
+        pasted (`text.pastes`, from LineEditor), only the big pastes are briefed and the typed words stay verbatim."""
+        limit = self.budget * 0.3 * self.chars_per_token  # chars
+        if len(text) <= limit:
+            return str(text)
+        s = str(text)
+        spans = [(a, b) for a, b in getattr(text, "spans", ()) if 0 <= a < b <= len(s)]
+        typed = "".join(s[e:a] for (_, e), (a, _) in zip([(0, 0)] + spans, spans + [(len(s), len(s))]))
+        context = " ".join(typed.split())[:400] or "(none: the paste is the whole message)"
+        chosen, left = [], len(s)
+        for a, b in sorted(spans, key=lambda x: x[0] - x[1]):  # biggest first, until what's left is comfortably small
+            if left <= limit / 2 or b - a < 1000:
+                continue
+            chosen.append((a, b))
+            left -= b - a
+        briefs, pieces, end = [], [], len(s)
+        for a, b in sorted(chosen):
+            p = s[a:b]
+            rel = self.save_input(p)
+            self.log(f"  [pasted text ({len(p):,} chars) saved to {rel}; briefing it]")
+            self.busy("condensing your paste")
+            words = brief_words(len(p))
             try:
-                brief = self.comp.run(BRIEF_PROMPT.format(words=300, text=text), 300, goal=text[:500])
+                brief = self.brief_long(p, words, PASTE_BRIEF_PROMPT, goal=context + " " + p[:300],
+                                        context=context, part="")
             except Exception as e:  # noqa: BLE001
-                brief = focus(text, text[:300], 1500)
+                brief = focus(p, context + " " + p[:300], 1500)
                 self.log(f"  [briefing failed: {str(e)[:80]}; using excerpt]")
-            text = (f"{brief}\n\n(The user pasted {len(text)} chars; condensed above. Full original saved at "
-                    f"{f.relative_to(self.cwd)} — read it with start= if details are missing.)")
-        return text
+            pieces.append((a, b, f"[pasted {len(p):,} chars → brief below; full text in {rel}]"))
+            briefs.append(f"--- brief of {rel} ---\n{brief}\n(condensed; for details {self.lookup_hint(rel)})")
+        cur = s
+        for a, b, marker in reversed(pieces):  # replace the pasted spans themselves, from the end so offsets hold
+            cur = cur[:a] + marker + cur[b:]
+        if briefs:
+            return cur + "\n\n" + "\n\n".join(briefs)
+        # no paste structure (piped stdin, a '"""' block, --once, typed text): brief the whole message as before
+        rel = self.save_input(text)
+        self.log(f"  [large message ({len(text):,} chars) saved to {rel}; briefing it]")
+        self.busy("condensing your long message")
+        words = brief_words(len(text))
+        try:
+            brief = self.brief_long(text, words, BRIEF_PROMPT, goal=text[:500])
+        except Exception as e:  # noqa: BLE001
+            brief = focus(text, text[:300], 1500)
+            self.log(f"  [briefing failed: {str(e)[:80]}; using excerpt]")
+        return (f"{brief}\n\n(The user sent {len(text):,} chars; condensed above. Full original saved at {rel}; "
+                f"if details are missing, {self.lookup_hint(rel)}.)")
 
     # -- model call
     def call_local(self, tools: bool = True, nudge: str | None = None):
@@ -1666,13 +1869,37 @@ class Agent:
 # ---------------------------------------------------------------- cli
 
 
-HELP = ("commands: /new  /notes  /mode code|advisor  /help  /quit\n"
+HELP = ("commands: /new  /notes  /mode code|advisor  /help  /quit   (this folder keeps its notes, turns and mode;\n"
+        "  .lowctx/notes.md is a readable copy of the notes)\n"
         "paste anything, any length: it arrives whole. Long or multi-line pastes show as [pasted …]; backspace "
-        "removes one in a go.\nnew line while typing: end the line with \\ (or wrap the message in \"\"\")."
+        "removes one in a go.\nA very long paste is saved to .lowctx/ and briefed; what you type around it is kept word for word.\n"
+        "new line while typing: end the line with \\ (or wrap the message in \"\"\")."
         "  Ctrl+C clears the line, Ctrl+D on an empty line quits\n")
 
 
 PASTE_INLINE = 200  # pastes longer than this, or with a newline, show as one [pasted …] token
+
+
+class UserText(str):
+    """A message from the prompt that remembers which parts of it were pasted, so prepare_user can brief a long
+    paste without condensing the question typed around it. Behaves as a plain str everywhere else.
+    `spans` are (start, end) offsets of each paste in the text; `pastes` the same as strings (for callers that
+    only know the text, each is located at its first occurrence)."""
+    spans: tuple = ()
+
+    @property
+    def pastes(self) -> tuple:
+        return tuple(self[a:b] for a, b in self.spans)
+
+    @pastes.setter
+    def pastes(self, texts) -> None:
+        spans, pos = [], 0
+        for t in texts:
+            i = self.find(t, pos) if t else -1
+            if i >= 0:
+                spans.append((i, i + len(t)))
+                pos = i + len(t)
+        self.spans = tuple(spans)
 
 
 class _Paste:
@@ -1823,12 +2050,22 @@ class LineEditor:
         else:
             self.buf.extend(text)
 
-    def result(self) -> str:
-        t = self.text().strip()
+    def result(self) -> UserText:
+        raw, spans, pos = self.text(), [], 0
+        for x in self.buf:  # where each paste sits in the raw text; typed text equal to a paste is not a paste
+            n = len(x.text) if isinstance(x, _Paste) else len(x)
+            if isinstance(x, _Paste):
+                spans.append((pos, pos + n))
+            pos += n
+        lead = len(raw) - len(raw.lstrip())  # the trimming below, tracked as an offset so the spans still fit
+        t = raw.strip()
         if t.startswith('"""'):
-            t = t[3:]
+            t, lead = t[3:], lead + 3
             t = t[:-3] if t.rstrip().endswith('"""') else t
-        return t.strip()
+        lead += len(t) - len(t.lstrip())
+        out = UserText(t.strip())
+        out.spans = tuple((a, b) for a, b in ((max(0, a - lead), min(len(out), b - lead)) for a, b in spans) if b > a)
+        return out
 
 
 def read_input(prompt: str = "you> ") -> str:
@@ -1897,12 +2134,9 @@ def main(argv: list | None = None, header=None, prog: str | None = None) -> None
         LOCAL_MODEL = a.model
 
     agent = Agent(Path(a.cwd).resolve(), a.budget, a.steps, a.think, a.mode, stream=not a.no_stream)
-    if header:
-        header(agent)
-    else:
-        print(f"lowctx  mode={agent.mode}  cwd={agent.cwd}  budget={a.budget} tok  compressor={agent.comp.name}  "
-              f"model={agent.get_model().split('/')[-2:] if '/' in agent.get_model() else agent.get_model()}")
-        print(HELP)
+    # the folder's saved mode wins over the default, not over an explicit --mode
+    explicit_mode = any(x == "--mode" or x.startswith("--mode=") for x in (sys.argv[1:] if argv is None else argv))
+    saved = None
     if a.once:  # leaves the session alone, but out-N/page-N numbers its notes point at must not be reused
         try:
             raw = agent.read_session_bytes()
@@ -1912,19 +2146,30 @@ def main(argv: list | None = None, header=None, prog: str | None = None) -> None
                     agent.n_out = n_out
         except (OSError, ValueError, AttributeError, TypeError, OverflowError, RecursionError):
             pass
-    else:  # one session per folder: pick up where the last chat here left off
-        if a.new:
-            agent.reset()
-        elif (saved := agent.load_session()):
-            ago = time.time() - float(saved.get("saved") or time.time())
-            when = (f"{ago / 86400:.0f}d ago" if ago >= 86400 else f"{ago / 3600:.0f}h ago" if ago >= 3600
-                    else f"{ago / 60:.0f}m ago" if ago >= 60 else "just now")
-            last = next((m["content"].removeprefix(RESTORED_NOTE) for m in reversed(agent.live) if m["role"] == "user"), "")
-            last = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", last).split())  # no escape codes from the file
-            print(_c("2", f"  resumed this folder's session ({agent.session_turns} turn{'s' * (agent.session_turns != 1)}, last {when})"
-                          + (f": “{last[:70]}{'…' if len(last) > 70 else ''}”" if last else "")
-                          + "  ·  /new starts fresh"))
-            print()
+    elif a.new:
+        agent.reset()
+    else:  # one session per folder: pick up where the last chat here left off (before the header shows the mode)
+        saved = agent.load_session(restore_mode=not explicit_mode)
+    if header:
+        header(agent)
+    else:
+        print(f"lowctx  mode={agent.mode}  cwd={agent.cwd}  budget={a.budget} tok  compressor={agent.comp.name}  "
+              f"model={agent.get_model().split('/')[-2:] if '/' in agent.get_model() else agent.get_model()}")
+        print(HELP)
+    default_mode = ap.get_default("mode")
+    if saved:
+        ago = time.time() - float(saved.get("saved") or time.time())
+        when = (f"{ago / 86400:.0f}d ago" if ago >= 86400 else f"{ago / 3600:.0f}h ago" if ago >= 3600
+                else f"{ago / 60:.0f}m ago" if ago >= 60 else "just now")
+        last = next((m["content"].removeprefix(RESTORED_NOTE) for m in reversed(agent.live) if m["role"] == "user"), "")
+        last = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", last).split())  # no escape codes from the file
+        print(_c("2", f"  resumed this folder's session ({agent.session_turns} turn{'s' * (agent.session_turns != 1)}, last {when})"
+                      + (f": “{last[:70]}{'…' if len(last) > 70 else ''}”" if last else "")
+                      + (f"  ·  {agent.mode} mode" if agent.mode != default_mode else "")
+                      + "  ·  /new starts fresh"))
+        print()
+    elif agent.mode != default_mode and not (a.once or a.new or explicit_mode):  # a saved /mode, no turns yet
+        print(_c("2", f"  this folder's session is in {agent.mode} mode  ·  /mode {default_mode} switches") + "\n")
     task = " ".join(a.task).strip()
     while True:
         if not task:
@@ -1950,6 +2195,11 @@ def main(argv: list | None = None, header=None, prog: str | None = None) -> None
             if len(parts) == 2 and parts[1] in ("code", "advisor"):
                 agent.set_mode(parts[1])
                 print(f"mode: {agent.mode}")
+                if not a.once:  # remembered for this folder, even if no turn follows
+                    try:
+                        agent.save_session()
+                    except OSError as e:
+                        print(f"  [could not save the session: {e}]")
             else:
                 print(f"mode: {agent.mode}  (usage: /mode code|advisor)")
         elif task.startswith("/") and " " not in task and len(task) < 20:

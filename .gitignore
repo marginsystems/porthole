@@ -15,6 +15,7 @@
 /bench/*
 !/bench/probe.py
 !/bench/run_tests.py
+!/bench/test_*.py
 !/bench/t1/
 !/bench/biz/
 .lowctx/

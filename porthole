@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """porthole: a small window onto a big, unfiltered mind.
 
-Local uncensored Qwen on Apple Silicon + DeepSeek subagents for the legwork.
+Local uncensored Qwen on Apple Silicon + helper-model subagents (any OpenAI-compatible API) for the legwork.
 """
 
 from __future__ import annotations
@@ -86,8 +86,8 @@ def info(s): print(f"  {c(DIM, '·')} {s}")
 
 def env() -> dict:
     import lowctx  # loads .env
-    return {"url": lowctx.LOCAL_URL, "model": lowctx.DEFAULT_MODEL, "key": bool(lowctx.COMP_KEY),
-            "comp": lowctx.COMP_MODEL}
+    return {"url": lowctx.LOCAL_URL, "model": lowctx.DEFAULT_MODEL, "key": lowctx.HELPER_ON,
+            "comp": lowctx.COMP_MODEL, "comp_url": lowctx.COMP_URL}
 
 
 def weights_missing(quant: str) -> str | None:
@@ -206,7 +206,7 @@ def cmd_status() -> int:
     (ok if server_up() else bad)(f"model server  {e['url']}  " + ("up" if server_up() else "down  (porthole up)"))
     quant = os.environ.get("QWEN_QUANT", "4-bit")
     (ok if (MODEL_DIR / quant).exists() else bad)(f"model         {MODEL_DIR.name}/{quant}")
-    (ok if e["key"] else info)(f"subagents     {e['comp'] + ' via DeepSeek' if e['key'] else 'off (set DEEPSEEK_API_KEY in .env)'}")
+    (ok if e["key"] else info)(f"subagents     {e['comp'] + ' via ' + e['comp_url'] if e['key'] else 'off (set HELPER_KEY or HELPER_URL in .env)'}")
     info(f"free memory   {mem_free_pct()}")
     return 0
 
@@ -232,7 +232,12 @@ def cmd_doctor() -> int:
                           else f"model weights: missing {missing}. Run: porthole pull")
     good &= have
     e = env()
-    (ok if e["key"] else info)("DeepSeek key found (subagents on)" if e["key"] else "no DeepSeek key: subagents off, local model summarizes (slow)")
+    (ok if e["key"] else info)(f"helper model {e['comp']} configured (subagents on)" if e["key"]
+                           else "no helper model: subagents off, local model summarizes (slow)")
+    import lowctx
+    if lowctx.HELPER_EXTRA_ERR:
+        bad(f"HELPER_EXTRA_BODY ignored: {lowctx.HELPER_EXTRA_ERR} (must be a JSON object)")
+        good = False
     for tool, why in (("rg", "faster grep"), ("pdftotext", "read PDFs (brew install poppler)")):
         (ok if shutil.which(tool) else info)(f"{tool:9} {'found' if shutil.which(tool) else 'optional: ' + why}")
     (ok if server_up() else info)("model server running" if server_up() else "model server not running (porthole up)")
@@ -276,7 +281,7 @@ HELP = f"""{c(BOLD, 'usage')}
   porthole pull [4-bit|6-bit|8-bit]   download Qwen weights from Hugging Face
 
 {c(BOLD, 'chat flags')}  --cwd DIR  --new  --budget TOKENS  --steps N  --think  --no-stream
-{c(BOLD, 'env')}         DEEPSEEK_API_KEY (in .env)  QWEN_QUANT  QWEN_KV  LOWCTX_URL  LOWCTX_MODEL
+{c(BOLD, 'env')}         HELPER_URL HELPER_KEY HELPER_MODEL (in .env)  QWEN_QUANT  QWEN_KV  LOWCTX_URL  LOWCTX_MODEL
 """
 
 

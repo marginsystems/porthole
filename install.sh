@@ -17,7 +17,7 @@ say "installing mlx-vlm (MLX inference server)"
 "$ROOT/.venv/bin/pip" install -q --upgrade pip
 "$ROOT/.venv/bin/pip" install -q -r "$ROOT/requirements.txt"
 
-[ -f "$ROOT/.env" ] || { cp "$ROOT/.env.example" "$ROOT/.env"; chmod 600 "$ROOT/.env"; say "created .env (add your DeepSeek key)"; }
+[ -f "$ROOT/.env" ] || { cp "$ROOT/.env.example" "$ROOT/.env"; chmod 600 "$ROOT/.env"; say "created .env (optional: add a helper model key/URL)"; }
 
 BIN="${PORTHOLE_BIN:-$HOME/.local/bin}"
 mkdir -p "$BIN"

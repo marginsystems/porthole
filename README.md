@@ -48,11 +48,11 @@ porthole keeps every step's prompt at about **12k tokens** or less no matter how
 * **Qwen holds the big picture.** It understands your request, plans, judges, edits and writes the answer.
 * **Subagents answer narrow questions.** Instead of paging through a file to learn one fact, Qwen calls
   `ask(question, hints)`: *"what is the monthly churn in revenue.csv?"*, *"where is `retry_limit` set and to
-  what?"*, *"cheapest paid ClickUp tier, with URL"*. Each ask is an independent DeepSeek worker with a large
+  what?"*, *"cheapest paid ClickUp tier, with URL"*. Each ask is an independent helper-model worker (DeepSeek by default) with a large
   context and read-only tools. It reads whole files, greps and browses, then returns only
   `ANSWER / EVIDENCE / UNSURE`. All asks in one step run in parallel, on a live board in the CLI.
 * **Workers never see your request.** They get only Qwen's question. Understanding the task is Qwen's job;
-  DeepSeek just does lookups.
+  the helper model just does lookups.
 * **If a worker refuses** (refusal text, content filter, moderation error) or fails, Qwen gets
   `[ask declined …] Find it yourself` and uses its own read/grep/search. Nothing stops.
 * **The compressor keys on Qwen's calls too.** Big tool output is reduced to what *that call* was after (the
@@ -64,7 +64,9 @@ porthole keeps every step's prompt at about **12k tokens** or less no matter how
 * Apple Silicon Mac (MLX). 32 GB RAM or more recommended for the 4-bit model (it uses about 16 GB plus a
   working margin); 64 GB+ for 6/8-bit.
 * Python 3.10+, ~16 GB free disk for the 4-bit weights.
-* Optional: a [DeepSeek API key](https://platform.deepseek.com) for subagents and fast compression;
+* Optional: a helper model for subagents and fast compression. Any OpenAI-compatible chat-completions
+  endpoint works (DeepSeek, OpenAI, OpenRouter, Groq, Together, or a second local server with a bigger
+  context); you only need its URL, key and model id. DeepSeek is the default. Also optional:
   `brew install ripgrep poppler` for faster grep and PDF reading.
 
 ## Quickstart
@@ -74,7 +76,7 @@ git clone https://github.com/marginsystems/porthole.git
 cd porthole
 ./install.sh            # venv + mlx-vlm, links `porthole` into ~/.local/bin, creates .env
 porthole pull           # downloads the 4-bit uncensored Qwen (~16 GB, resumable)
-$EDITOR .env            # optional: DEEPSEEK_API_KEY=sk-...
+$EDITOR .env            # optional: HELPER_KEY=sk-... (and HELPER_URL / HELPER_MODEL for non-DeepSeek)
 porthole doctor         # checks everything
 porthole                # starts the model server if needed, opens a chat in the current folder
 ```
@@ -118,16 +120,18 @@ work. What you do with it is on you. Read the model card.
 | `porthole doctor` | checks the machine and the install |
 | `porthole pull [quant]` | downloads weights from Hugging Face |
 
-One session per folder: run `porthole` again in the same folder and it picks up the notes and recent turns
-from last time (`.lowctx/session.json`). `porthole --new` or `/new` starts fresh; `porthole run` one-shots
-leave the session alone.
+One session per folder: run `porthole` again in the same folder and it picks up the notes, recent turns and
+mode from last time (`.lowctx/session.json`; an explicit `--mode` wins). `.lowctx/notes.md` is a readable copy of
+the notes, rewritten after every turn. `porthole --new` or `/new` starts fresh; `porthole run` one-shots leave the
+session alone.
 
 In chat: `/new` clears the conversation, `/notes` shows the compressed memory, `/mode code|advisor` switches
 mode, `/quit` exits. Paste anything, any length: the prompt reads the terminal's bracketed paste, so a paste
 arrives whole and Enter inside it is a newline. Long or multi-line pastes show as `[pasted 3,412 chars, 57 lines]`
 and backspace removes one in a go; end a typed line with `\` for a new line. Ctrl+C stops a reply (the turn is
 discarded) or clears the prompt. Messages over ~30% of the token budget are saved to `.lowctx/` and replaced by a
-brief, and the model can still read the original.
+brief. When you paste into the prompt, only the big pastes are saved and briefed; what you typed around them stays
+word for word. The model can still read the original, or `ask` a subagent about it.
 
 Scratch data (the session, saved pages, big outputs, `transcript.jsonl`) goes to `./.lowctx/` in the folder you
 chat from; it carries its own `.gitignore` so none of it gets committed.
@@ -147,23 +151,23 @@ chat from; it carries its own `.gitignore` so none of it gets committed.
   investor tear this apart?"*
 * **Pre-mortems and red-teaming your own stuff.** Landing page copy, a hiring plan, a launch checklist:
   *"Assume this failed in 6 months. Why?"*
-* **Offline thinking partner.** Leave `DEEPSEEK_API_KEY` empty and no model outside your Mac sees anything. Use it
+* **Offline thinking partner.** Leave `HELPER_KEY` and `HELPER_URL` empty and no model outside your Mac sees anything. Use it
   for strategy, journaling or anything you'd rather not send to a cloud model. In advisor mode, `web_search` and
   `fetch` still go online when Qwen uses them; switch to `/mode code` or just don't ask for research.
 
 ## Privacy
 
-| stays on your Mac | goes to DeepSeek (only if a key is set) |
+| stays on your Mac | goes to the helper model (only if one is set) |
 |---|---|
 | the model and every prompt Qwen sees | each `ask` question and everything its worker reads or fetches, **including your local files** |
 | file edits and bash commands Qwen runs itself | text the compressor summarizes: old turns of your chat, big tool output, long pastes |
-| `.lowctx/` (saved pastes, outputs, transcript): workers can't open it | |
+| `.lowctx/` (session, notes, outputs, transcript): workers can't open it | saved pastes (`.lowctx/input-*.txt`) when Qwen asks a worker about one |
 
-With a key set, Qwen sends most file lookups to workers, so assume the files it works with reach DeepSeek.
+With a key set, Qwen sends most file lookups to workers, so assume the files it works with reach the helper model.
 Workers can only read, grep and list inside the folder you launched porthole from. They can never open
 credential-looking files (`.env*`, `*.pem`/`*.key`, `id_rsa*`, `~/.ssh`, `.aws`, `credentials*`, …), even if a
 file or web page they read tells them to.
-For sensitive folders, remove the key: the `ask` tool disappears and compression runs on the local model, so no
+For sensitive folders, remove the helper (or point `HELPER_URL` at a second local server): the `ask` tool disappears and compression runs on the local model, so no
 cloud model sees your files or chat. Web access is separate: in advisor mode `web_search` sends queries to
 DuckDuckGo (Bing as fallback) and `fetch` downloads whatever URL Qwen picks, key or not. Code mode has no web tools.
 
@@ -173,8 +177,11 @@ DuckDuckGo (Bing as fallback) and `fetch` downloads whatever URL Qwen picks, key
 
 | env | default | |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | none | enables subagents + fast compressor |
-| `DEEPSEEK_MODEL` / `DEEPSEEK_URL` | `deepseek-flash` / `https://api.deepseek.com/v1` | the API accepts `deepseek-flash`, `deepseek-v4-pro` |
+| `HELPER_KEY` | none | API key of the helper model; setting it (or `HELPER_URL`) enables subagents + fast compressor |
+| `HELPER_URL` | `https://api.deepseek.com/v1` | any OpenAI-compatible endpoint (OpenAI, OpenRouter, Groq, Together, a local mlx_vlm / llama.cpp / Ollama server); set explicitly, it enables the helper even without a key |
+| `HELPER_MODEL` | `deepseek-flash` | model id at that endpoint (DeepSeek accepts `deepseek-flash`, `deepseek-v4-pro`) |
+| `HELPER_EXTRA_BODY` | none | JSON object merged into every helper request, for a provider's reasoning switch. DeepSeek URLs get `thinking: disabled` and localhost URLs `enable_thinking: false` automatically |
+| `DEEPSEEK_API_KEY` / `DEEPSEEK_URL` / `DEEPSEEK_MODEL` | | older names, still accepted when the `HELPER_*` one is unset |
 | `QWEN_QUANT` | `4-bit` | which build `porthole up` loads and the harness requests |
 | `QWEN_KV` | `16384` | server context cap in tokens (prompts ≤~12k + up to 1.2k of answer + headroom) |
 | `QWEN_PREFILL` | `512` | prefill chunk; larger chunks ran Metal out of memory on 16k prompts |
@@ -212,6 +219,7 @@ mlx_vlm swaps models when a request names a different one, so keep `QWEN_QUANT` 
 Live tests against the running model, one request at a time. They take tens of minutes and keep the GPU busy.
 Fixtures: `bench/t1` (a small package with 5 planted bugs) and `bench/biz` (a fictional SaaS with obvious
 problems). `bench/probe.py tools|needle N,N|cache` probes tool calling, long-context recall and speed.
+`python3 bench/test_unit.py` runs the offline unit tests (no server needed) in under a second.
 
 ## Known limitations
 
