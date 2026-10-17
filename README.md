@@ -123,8 +123,11 @@ from last time (`.lowctx/session.json`). `porthole --new` or `/new` starts fresh
 leave the session alone.
 
 In chat: `/new` clears the conversation, `/notes` shows the compressed memory, `/mode code|advisor` switches
-mode, `/quit` exits. Paste freely; multi-line pastes are joined, or wrap long text in `"""`. Huge pastes are
-saved to `.lowctx/` and replaced by a brief, and the model can still read the original.
+mode, `/quit` exits. Paste anything, any length: the prompt reads the terminal's bracketed paste, so a paste
+arrives whole and Enter inside it is a newline. Long or multi-line pastes show as `[pasted 3,412 chars, 57 lines]`
+and backspace removes one in a go; end a typed line with `\` for a new line. Ctrl+C stops a reply (the turn is
+discarded) or clears the prompt. Messages over ~30% of the token budget are saved to `.lowctx/` and replaced by a
+brief, and the model can still read the original.
 
 Scratch data (the session, saved pages, big outputs, `transcript.jsonl`) goes to `./.lowctx/` in the folder you
 chat from; it carries its own `.gitignore` so none of it gets committed.

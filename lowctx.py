@@ -35,6 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import unicodedata
 import uuid
 import zlib
 from html.parser import HTMLParser
@@ -282,6 +283,7 @@ class Streamer:
         if not self.printed:
             s = s.lstrip()
         if s:
+            WAIT.hide()
             if self.mark:
                 s = s.replace("\n", "\n" + " " * len(REPLY_MARK))
                 if not self.printed:
@@ -340,7 +342,10 @@ class Compressor:
             body["thinking"] = {"type": "disabled"}
         elif THINK_FIELD:
             body["enable_thinking"] = False
-        d = post_chat(url, key, body, timeout=180 if remote else 1800)
+        # local calls stream: if Ctrl+C drops the connection the server stops generating, instead of finishing
+        # a summary nobody reads while the next message queues behind it
+        d = (post_chat(url, key, body, timeout=180) if remote
+             else stream_chat(url, key, body, lambda s: None, timeout=1800))
         out = (d["choices"][0]["message"].get("content") or "").strip()
         return re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
 
@@ -956,6 +961,58 @@ def _c(code: str, s: str) -> str:
     return f"\033[{code}m{s}\033[0m" if _TTY else s
 
 
+class Waiting:
+    """The reply caret with a spinner, label and timer, shown the moment a message is sent and whenever the
+    model or a tool is busy, so the chat never looks hung. Whatever prints next (the reply, a log line, the
+    subagent board) calls hide() first and takes the line over."""
+
+    FRAMES = "◐◓◑◒"
+
+    def __init__(self):
+        import threading
+        self.on = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+        self.label, self.t0, self.shown = "", 0.0, False
+        self.lock = threading.Lock()
+        self.thread = threading.Thread(target=self._loop, daemon=True) if self.on else None
+        self.started = False
+
+    def show(self, label: str) -> None:
+        if not self.on:
+            return
+        with self.lock:
+            if not self.shown or label != self.label:
+                self.t0 = time.time()
+            self.label, self.shown = label, True
+            self._draw()
+        if not self.started:
+            self.started = True
+            self.thread.start()
+
+    def hide(self) -> None:
+        if not self.shown:
+            return
+        with self.lock:
+            if self.shown:
+                sys.stdout.write("\r\033[2K")
+                sys.stdout.flush()
+                self.shown = False
+
+    def _draw(self) -> None:
+        f = self.FRAMES[int(time.time() * 5) % len(self.FRAMES)]
+        sys.stdout.write(f"\r\033[2K{reply_mark()}{_c('38;5;38', f)} {_c('2', f'{self.label}… {time.time() - self.t0:.0f}s')}")
+        sys.stdout.flush()
+
+    def _loop(self) -> None:
+        while True:
+            time.sleep(0.2)
+            with self.lock:
+                if self.shown:
+                    self._draw()
+
+
+WAIT = Waiting()
+
+
 class SubagentBoard:
     """One animated row per subagent: sonar spinner, question, current action, timer; ✓/✗ when done."""
 
@@ -981,6 +1038,7 @@ class SubagentBoard:
     def __enter__(self):
         if self.quiet:
             return self
+        WAIT.hide()
         if self.live:
             sys.stdout.write("\033[?25l")  # hide cursor while animating
             self._draw()
@@ -1101,7 +1159,12 @@ class Agent:
     # -- io
     def log(self, s: str) -> None:
         if not self.quiet:
+            WAIT.hide()
             print(s, flush=True)
+
+    def busy(self, label: str) -> None:
+        if not self.quiet:
+            WAIT.show(label)
 
     def record(self, kind: str, **kw) -> None:
         self.transcript.write(json.dumps({"t": time.time(), "kind": kind, **kw}, ensure_ascii=False) + "\n")
@@ -1252,6 +1315,7 @@ class Agent:
         words = max(200, min(450, self.budget // 10))
         tmpl = NOTES_CHAT if self.mode == "advisor" else NOTES_CODE
         prompt = (tmpl.format(words=words) + f"\n\nOLD NOTES:\n{self.notes or '(none)'}\n\nNEW EVENTS:\n" + "\n".join(events))
+        self.busy("condensing older context into notes")
         try:
             notes = self.comp.run(prompt, words)
         except Exception as e:  # noqa: BLE001
@@ -1334,6 +1398,7 @@ class Agent:
         # the caller's own words, never the user's request: DeepSeek doesn't need to understand the task
         purpose = (str(args.get("purpose") or "").strip() or intent.strip()[:600]
                    or "not stated: keep the most informative lines")
+        self.busy(f"digesting {len(out):,} chars of {name} output")
         try:
             digest = self.comp.run(DIGEST_PROMPT.format(call=call, purpose=purpose, words=220) +
                                    "\n\nOUTPUT:\n" + out, 220, goal=purpose + " " + call)
@@ -1349,6 +1414,7 @@ class Agent:
             f = self.store / f"input-{int(time.time())}-{self.n_out}.txt"
             f.write_text(text)
             self.log(f"  [large message ({len(text)} chars) saved to {f.relative_to(self.cwd)}; briefing it]")
+            self.busy("condensing your long message")
             try:
                 brief = self.comp.run(BRIEF_PROMPT.format(words=300, text=text), 300, goal=text[:500])
             except Exception as e:  # noqa: BLE001
@@ -1373,6 +1439,7 @@ class Agent:
             if THINK_FIELD:
                 body["enable_thinking"] = self.think
             t = time.time()
+            self.busy("thinking" if tools else "writing the answer")
             streamer = Streamer() if (self.stream and not self.quiet) else None
             try:
                 if self.stream:
@@ -1385,6 +1452,8 @@ class Agent:
                     self.compact(force=True)
                     continue
                 raise
+            finally:
+                WAIT.hide()
             break
         dt = time.time() - t
         u = d.get("usage") or {}
@@ -1440,15 +1509,31 @@ class Agent:
                 jobs.append((c["id"], str(a.get("question") or a.get("task") or ""), str(a.get("hints") or "")))
         if not jobs:
             return {}
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import queue
+        import threading
         res: dict = {}
-        with SubagentBoard([q for _, q, _ in jobs], quiet=self.quiet) as board, \
-                ThreadPoolExecutor(max_workers=SUB_PARALLEL) as pool:
-            futs = {pool.submit(ask_subagent, q, h, self.tools, lambda s, i=i: board.update(i, s)): (i, cid)
-                    for i, (cid, q, h) in enumerate(jobs)}
-            for f in as_completed(futs):  # tick each row off the moment its worker finishes
-                i, cid = futs[f]
-                ok, text = f.result()
+        done: queue.Queue = queue.Queue()
+        slots = threading.Semaphore(SUB_PARALLEL)
+
+        def work(i: int, cid: str, q: str, h: str, board) -> None:
+            with slots:
+                try:
+                    r = ask_subagent(q, h, self.tools, lambda s: board.update(i, s))
+                except Exception as e:  # noqa: BLE001
+                    r = (False, f"[ask failed: {e}] {SUB_FALLBACK}")
+            done.put((i, cid, r))
+
+        with SubagentBoard([q for _, q, _ in jobs], quiet=self.quiet) as board:
+            # daemon threads, not an executor: Ctrl+C must not wait for every worker's HTTP call to finish
+            for i, (cid, q, h) in enumerate(jobs):
+                threading.Thread(target=work, args=(i, cid, q, h, board), daemon=True).start()
+            for _ in jobs:  # tick each row off the moment its worker finishes
+                while True:
+                    try:
+                        i, cid, (ok, text) = done.get(timeout=0.2)
+                        break
+                    except queue.Empty:
+                        continue
                 board.done(i, ok, text)
                 res[cid] = text
                 if not ok and not self.direct:  # "find it yourself" must be possible: hand the tools back
@@ -1540,6 +1625,8 @@ class Agent:
                             trips += 1
                             out = f"error: you already made this exact call {seen[sig] - 1} times with the same result. Do not repeat it; use what you have and answer."
                         else:
+                            if c["id"] not in pre:
+                                self.busy(f"running {name}")
                             out = pre[c["id"]] if c["id"] in pre else self.tools.run(name, args)
                             if seen[sig] == 2:
                                 out += "\n[note: you already made this exact call. Use the result and move on.]"
@@ -1580,10 +1667,183 @@ class Agent:
 
 
 HELP = ("commands: /new  /notes  /mode code|advisor  /help  /quit\n"
-        'multi-line: wrap in """ ... """, end a line with \\, or just paste (pasted lines are joined)\n')
+        "paste anything, any length: it arrives whole. Long or multi-line pastes show as [pasted …]; backspace "
+        "removes one in a go.\nnew line while typing: end the line with \\ (or wrap the message in \"\"\")."
+        "  Ctrl+C clears the line, Ctrl+D on an empty line quits\n")
+
+
+PASTE_INLINE = 200  # pastes longer than this, or with a newline, show as one [pasted …] token
+
+
+class _Paste:
+    def __init__(self, text: str):
+        self.text = text
+
+    def label(self) -> str:
+        n = self.text.count("\n") + 1
+        return f"[pasted {len(self.text):,} chars" + (f", {n} lines]" if n > 1 else "]")
+
+
+class LineEditor:
+    """The chat prompt, read key by key with the terminal in cbreak mode. input() reads a canonical tty line,
+    which macOS caps at 1024 bytes (MAX_CANON): a long paste came through cut down to a fragment. Here bracketed
+    paste mode hands over each paste whole, and Enter inside a paste is a newline, not a send."""
+
+    def __init__(self, prompt: str, more: str = "...  "):
+        self.prompt, self.more = prompt, more
+        self.buf: list = []  # typed characters and _Paste tokens
+        self.rows = 1  # screen rows the last draw took; the cursor sits on the last one
+        self.shown: str | None = None  # what the last draw left on screen
+
+    def text(self) -> str:
+        return "".join(x.text if isinstance(x, _Paste) else x for x in self.buf)
+
+    def draw(self) -> None:
+        # control bytes from a paste are shown as ^X, never sent to the terminal as commands
+        body = "".join(_c("38;5;38", x.label()) if isinstance(x, _Paste)
+                       else re.sub(r"[\x00-\x09\x0b-\x1f\x7f]", lambda m: "^" + chr(ord(m.group()) ^ 0x40), x)
+                       for x in self.buf)
+        out = self.prompt + body.replace("\n", "\n" + self.more)
+        width = max(20, shutil.get_terminal_size((100, 20)).columns)
+        plain = re.sub(r"\033\[[0-9;]*m", "", out)
+        # terminal columns, not code points: a CJK character takes two, a combining mark none
+        cols = [sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1
+                    for c in l) for l in plain.split("\n")]
+        rows = sum(max(1, -(-n // width)) for n in cols)
+        if self.shown is not None and out.startswith(self.shown):
+            sys.stdout.write(out[len(self.shown):].replace("\n", "\r\n"))  # typed on: write only the new part
+        else:
+            up = f"\033[{self.rows - 1}A" if self.rows > 1 else ""
+            sys.stdout.write(up + "\r\033[J" + out.replace("\n", "\r\n"))
+        sys.stdout.flush()
+        self.shown, self.rows = out, rows
+
+    def _open_block(self) -> bool:
+        t = self.text().lstrip()
+        return t.startswith('"""') and not (len(t) >= 6 and t.rstrip().endswith('"""'))
+
+    def read(self) -> str:
+        import codecs
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        esc, paste = "", None  # an escape sequence split across reads; the paste being collected
+        try:
+            tty.setcbreak(fd, termios.TCSANOW)  # no echo, no line discipline; keeps typed-ahead input
+            sys.stdout.write("\033[?2004h")  # bracketed paste on
+            self.draw()
+            while True:
+                try:
+                    chunk = esc + dec.decode(os.read(fd, 65536))
+                except KeyboardInterrupt:  # Ctrl+C clears a half-typed message; on an empty prompt it quits
+                    if not self.buf and paste is None:  # an in-progress paste counts as input
+                        raise
+                    self.buf, esc = [], ""
+                    if paste is not None:
+                        paste = []  # still inside ESC[200~..ESC[201~: keep reading the paste as a paste
+                    self.draw()
+                    continue
+                if not chunk:
+                    raise EOFError
+                esc, i = "", 0
+                while i < len(chunk):
+                    if paste is not None and not chunk.startswith("\x1b[201~", i):
+                        # inside a bracketed paste every byte is data (ESC included) up to the closing marker
+                        end = chunk.find("\x1b[201~", i)
+                        if end < 0:
+                            end = len(chunk)
+                            k = chunk.rfind("\x1b")
+                            if k >= i and "\x1b[201~".startswith(chunk[k:]):  # closing marker split across reads
+                                esc, end = chunk[k:], k
+                        paste.append(chunk[i:end])
+                        i = end
+                        if esc:
+                            break
+                        continue
+                    ch = chunk[i]
+                    if ch == "\x1b":
+                        m = re.match(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|O.)", chunk[i:])
+                        if not m:
+                            if re.fullmatch(r"\x1b(\[[0-9;?]*[ -/]*|O)?", chunk[i:]):  # incomplete: finish it next read
+                                esc = chunk[i:]
+                                break
+                            i += 1  # a bare Esc: drop it, the following key is handled as its own key
+                            continue
+                        seq = m.group(0)
+                        i += len(seq)
+                        if seq == "\x1b[200~":
+                            paste = []
+                        elif seq == "\x1b[201~" and paste is not None:
+                            self.add_paste("".join(paste).replace("\r\n", "\n").replace("\r", "\n"))
+                            paste = None
+                            self.draw()
+                        continue  # arrows and other keys: ignored
+                    i += 1
+                    if ch in "\r\n":
+                        # Enter mid-burst is a paste from a terminal without bracketed paste: keep the newline
+                        burst = i < len(chunk) or select.select([fd], [], [], 0.01)[0]
+                        if burst or self._open_block():
+                            self.buf.append("\n")
+                        elif self.buf and self.buf[-1] == "\\":
+                            self.buf[-1] = "\n"
+                        else:
+                            self.draw()  # a burst can end in its Enter before it was ever drawn
+                            sys.stdout.write("\r\n")
+                            return self.result()
+                    elif ch in "\x7f\x08":
+                        if self.buf:
+                            self.buf.pop()
+                    elif ch == "\x15":  # Ctrl+U
+                        self.buf = []
+                    elif ch == "\x17":  # Ctrl+W: back to the previous word
+                        while self.buf and self.buf[-1] == " ":
+                            self.buf.pop()
+                        while self.buf and isinstance(self.buf[-1], str) and self.buf[-1] not in " \n":
+                            self.buf.pop()
+                    elif ch == "\x04":
+                        if not self.buf:
+                            sys.stdout.write("\r\n")
+                            raise EOFError
+                    elif ch == "\t":
+                        self.buf.extend("    ")
+                    elif ch >= " ":
+                        self.buf.append(ch)
+                if paste is None:
+                    self.draw()
+        finally:
+            sys.stdout.write("\033[?2004l")
+            sys.stdout.flush()
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def add_paste(self, text: str) -> None:
+        if "\n" in text or len(text) > PASTE_INLINE:
+            self.buf.append(_Paste(text))
+        else:
+            self.buf.extend(text)
+
+    def result(self) -> str:
+        t = self.text().strip()
+        if t.startswith('"""'):
+            t = t[3:]
+            t = t[:-3] if t.rstrip().endswith('"""') else t
+        return t.strip()
 
 
 def read_input(prompt: str = "you> ") -> str:
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            import termios  # noqa: F401  (POSIX only)
+        except ImportError:
+            pass
+        else:
+            return LineEditor(prompt).read()
+    return read_input_lines(prompt)
+
+
+def read_input_lines(prompt: str = "you> ") -> str:
+    """Plain input() fallback: piped stdin, or a platform without termios."""
     tty = sys.stdin.isatty()
     first = input(prompt)
     lines = [first]
@@ -1697,6 +1957,7 @@ def main(argv: list | None = None, header=None, prog: str | None = None) -> None
         elif task:
             if sys.stdout.isatty():
                 print()  # the reply starts below the prompt line, not glued to it
+            WAIT.show("sending")  # at once, before any slow work: the turn has visibly started
             try:
                 ans = agent.run(task)
                 if not agent.streamed:
@@ -1708,8 +1969,10 @@ def main(argv: list | None = None, header=None, prog: str | None = None) -> None
                         print(f"  [could not save the session: {e}]")
                 print(_c("2", agent.summary()) + "\n")
             except KeyboardInterrupt:
+                WAIT.hide()
                 print("\n(interrupted; the turn was discarded)\n")
             except Exception as e:  # noqa: BLE001
+                WAIT.hide()
                 print(f"\n[error: {e}] — the turn was rolled back; try again or /new\n")
         task = ""
         if a.once:
