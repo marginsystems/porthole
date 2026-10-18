@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Re-runnable live tests for lowctx against the local model server (one request at a time).
 
-    bench/run_tests.py [t1] [biz] [research] [long] [paste]     (default: all)
+    bench/run_tests.py [t1] [biz] [research] [long] [paste] [resume]     (default: all)
 
 Logs go to bench/logs/<name>.log. Each test prints PASS/FAIL checks plus steps / seconds / max prompt tokens.
 """
@@ -22,10 +22,13 @@ BUDGET = 12000
 TIMEOUT = 2400  # seconds per test
 
 
-def run(name, cwd, stdin, extra=()):
+def run(name, cwd, stdin, extra=(), fresh=True):
+    """fresh: start a new session. Each folder keeps one resumable session, and several tests share bench/biz,
+    so without --new every test would resume the previous test's conversation."""
     t = time.time()
+    cmd = [PY, str(ROOT / "lowctx.py"), *(["--new"] if fresh else []), *extra]
     try:  # subprocess.run kills the child on timeout, so no orphans
-        p = subprocess.run([PY, str(ROOT / "lowctx.py"), *extra], cwd=cwd, input=stdin, capture_output=True,
+        p = subprocess.run(cmd, cwd=cwd, input=stdin, capture_output=True,
                            text=True, timeout=TIMEOUT)
         out = p.stdout + p.stderr
     except subprocess.TimeoutExpired as e:
@@ -76,8 +79,15 @@ def research():
          "whether my $9/user plan is underpriced.")
     st = run("research", ROOT / "bench/biz", q + "\n/quit\n")
     o = st["out"]
-    return report("web research", st, [("called web_search", "→ web_search" in o), ("called fetch", "→ fetch" in o),
-                                       ("cites a URL", re.search(r"https?://\S+", o.split("→ fetch")[-1]) is not None)])
+    # with a helper key, advisor mode sends web lookups to ask subagents (web_search/fetch come back only if one
+    # declines), so a lookup is any of: subagents, web_search, fetch, or curl through bash
+    looked = re.search(r"subagents? working|→ web_search|→ fetch|→ bash \{\"cmd\": \"curl", o) is not None
+    steps = o.split("[turn:")[0].split("· step")  # the streamed answer prints just before the last step line
+    answer = steps[-2] if len(steps) > 1 else o
+    return report("web research", st, [("looked it up on the web", looked),
+                                       ("cites a URL or names the sites", re.search(
+                                           r"https?://\S+|teamwork\.com|productive\.io", answer, re.I) is not None),
+                                       ("gives a price", re.search(r"\$\d", answer) is not None)])
 
 
 LONG = [
@@ -134,8 +144,28 @@ def paste():
         (f"max prompt <= {BUDGET + 1500}", st["max_prompt"] <= BUDGET + 1500)])
 
 
+def resume():
+    """Quit and start again in the same folder: the facts, the saved notes and the mode come back."""
+    cwd = Path(tempfile.mkdtemp(prefix="porthole-resume-"))
+    first = run("resume-1", cwd, "My company is called Plumtree Labs and our churn target is 3.5 percent. "
+                "Just acknowledge in one sentence; do not use any tools.\n/quit\n", ["--mode", "code"])
+    st = run("resume-2", cwd, "Without using any tools: what is my company called, and what is our churn target?\n"
+             "/quit\n", fresh=False)
+    o = st["out"]
+    reply = o.split("you>")[1] if o.count("you>") >= 2 else o
+    checks = [("first run finished its turn", "[turn:" in first["out"]),
+              ("second run resumed the session", "resumed this folder's session" in o),
+              ("mode came back as code", "mode=code" in o),
+              ("remembers the company name", "plumtree" in reply.lower()),
+              ("remembers the 3.5% target", "3.5" in reply),
+              ("notes.md or session.json written", (cwd / ".lowctx/session.json").exists())]
+    shutil.rmtree(cwd, ignore_errors=True)
+    st["secs"] += first["secs"]
+    return report("resume across restarts", st, checks)
+
+
 if __name__ == "__main__":
-    names = sys.argv[1:] or ["t1", "biz", "research", "long", "paste"]
+    names = sys.argv[1:] or ["t1", "biz", "research", "long", "paste", "resume"]
     res = {n: globals()[n]() for n in names}
     print("\nSUMMARY:", ", ".join(f"{n}={'PASS' if v else 'FAIL'}" for n, v in res.items()))
     sys.exit(0 if all(res.values()) else 1)
