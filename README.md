@@ -185,6 +185,7 @@ DuckDuckGo (Bing as fallback) and `fetch` downloads whatever URL Qwen picks, key
 | `QWEN_QUANT` | `4-bit` | which build `porthole up` loads and the harness requests |
 | `QWEN_KV` | `16384` | server context cap in tokens (prompts ≤~12k + up to 1.2k of answer + headroom) |
 | `QWEN_PREFILL` | `512` | prefill chunk; larger chunks ran Metal out of memory on 16k prompts |
+| `QWEN_CACHE_GB` | `2` | cap on MLX's cache of freed GPU buffers, so memory the server frees goes back to macOS (uncapped it can hold ~95% of RAM) |
 | `LOWCTX_URL` / `LOWCTX_MODEL` / `LOWCTX_KEY` | local mlx server | point porthole at **any OpenAI-compatible model** (LM Studio, llama.cpp, Ollama's `/v1`, vLLM…) |
 | `LOWCTX_BUDGET` | `12000` | target prompt tokens per step (`--budget`). Lower = faster steps, more compaction |
 | `LOWCTX_STEPS` | `20` | max tool steps per turn (`--steps`) |
