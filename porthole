@@ -264,7 +264,7 @@ def chat_header(agent) -> None:
     banner()
     e = env()
     sub = f"{e['comp']}" if e["key"] else "off"
-    info(f"mode {c(BOLD, agent.mode)}  ·  {agent.cwd}  ·  budget {agent.budget // 1000}k tok  ·  subagents {sub}")
+    info(f"mode {c(BOLD, agent.mode)}  ·  {agent.tools.where}  ·  budget {agent.budget // 1000}k tok  ·  subagents {sub}")
     info('/new  /notes  /mode code|advisor  /help  /quit   ·   paste anything  ·  Ctrl+C stops a reply')
     print()
 
@@ -275,12 +275,14 @@ HELP = f"""{c(BOLD, 'usage')}
   porthole chat [--mode code|advisor] [first message]
   porthole run  "task"           one-shot: do the task in this folder, print the result, exit
                                  (code mode; add --mode advisor for a one-shot opinion)
+  porthole chat --mode code --ssh myserver:/srv/app
+                                 work on a folder on another machine over ssh (key login)
   porthole up | down             start / stop the local model server (frees ~16 GB when down)
   porthole status                server, model, subagents, free memory
   porthole doctor                check this machine and the install
   porthole pull [4-bit|6-bit|8-bit]   download Qwen weights from Hugging Face
 
-{c(BOLD, 'chat flags')}  --cwd DIR  --new  --budget TOKENS  --steps N  --think  --no-stream
+{c(BOLD, 'chat flags')}  --cwd DIR  --ssh HOST:PATH  --new  --budget TOKENS  --steps N  --think  --no-stream
 {c(BOLD, 'env')}         HELPER_URL HELPER_KEY HELPER_MODEL (in .env)  QWEN_QUANT  QWEN_KV  LOWCTX_URL  LOWCTX_MODEL
 """
 

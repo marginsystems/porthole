@@ -115,6 +115,7 @@ work. What you do with it is on you. Read the model card.
 | `porthole chat --mode code` | coding-agent mode: ask/ls/read/grep/edit/write/bash |
 | `porthole run "task"` | one-shot: do the task in this folder, print the result, exit (code mode) |
 | `porthole run --mode advisor "question"` | one-shot opinion |
+| `porthole chat --mode code --ssh myserver:/srv/app` | work on a folder on another machine over ssh (see below) |
 | `porthole up` / `porthole down` | start / stop the model server. **down frees ~16 GB**; do it when you're done |
 | `porthole status` | server, model, subagents, free memory |
 | `porthole doctor` | checks the machine and the install |
@@ -135,6 +136,28 @@ word for word. The model can still read the original, or `ask` a subagent about 
 
 Scratch data (the session, saved pages, big outputs, `transcript.jsonl`) goes to `./.lowctx/` in the folder you
 chat from; it carries its own `.gitignore` so none of it gets committed.
+
+### A folder on another machine
+
+`--ssh HOST:PATH` (on `porthole`, `chat` or `run`) points every tool at a folder on a server instead of the local
+one: ls/read/grep/edit/write and bash run there, and so do the lookups `ask` workers make. `HOST` is anything `ssh`
+accepts, including a `~/.ssh/config` alias (an IPv6 address goes in brackets: `[2001:db8::1]:/srv`); `PATH` may be
+absolute, `~/app` or relative to the remote home.
+
+```bash
+porthole chat --mode code --ssh myserver:~/app
+porthole run --ssh deploy@10.0.0.5:/srv/api "why does the health check fail? fix it and rerun the tests"
+```
+
+* Qwen, the helper model and the session stay on your Mac. Saved outputs and pastes stay in the local `.lowctx/`,
+  and each remote folder gets its own session there (`session-ssh-*.json`).
+* One ssh connection is shared by every call (`ControlMaster`, socket in `~/.ssh/porthole-*`, closed 10 minutes
+  after the last call), so a tool call costs a round trip, not a new login.
+* Key login only: porthole can't answer a password or host-key prompt. Run `ssh HOST` once yourself first.
+* The server needs only a POSIX shell and coreutils (`rg` is used when it is installed). PDFs and Word files are
+  converted on your Mac.
+* bash runs real commands on that machine. Point it at a staging box or a checkout, not at production, unless you
+  mean it.
 
 ## Use cases
 
@@ -164,7 +187,8 @@ chat from; it carries its own `.gitignore` so none of it gets committed.
 | `.lowctx/` (session, notes, outputs, transcript): workers can't open it | saved pastes (`.lowctx/input-*.txt`) when Qwen asks a worker about one |
 
 With a key set, Qwen sends most file lookups to workers, so assume the files it works with reach the helper model.
-Workers can only read, grep and list inside the folder you launched porthole from. They can never open
+Workers can only read, grep and list inside the folder you launched porthole from (or the `--ssh` folder; symlinks
+pointing out of it are followed on the server and refused). They can never open
 credential-looking files (`.env*`, `*.pem`/`*.key`, `id_rsa*`, `~/.ssh`, `.aws`, `credentials*`, …), even if a
 file or web page they read tells them to.
 For sensitive folders, remove the helper (or point `HELPER_URL` at a second local server): the `ask` tool disappears and compression runs on the local model, so no

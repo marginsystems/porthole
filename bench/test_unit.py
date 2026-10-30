@@ -190,5 +190,130 @@ class Session(Base):
         self.assertEqual(seen, ["code", "advisor", "advisor"])
 
 
+# Stands in for ssh: '[-o opt]... -- host command', run by /bin/sh in $FAKE_HOME like a remote login shell would.
+FAKE_SSH = """#!/bin/sh
+while [ "$1" != "--" ]; do shift; done
+shift
+host=$1; shift
+[ "$host" = down ] && { echo "ssh: connect to host down port 22: Connection refused" >&2; exit 255; }
+cd "$FAKE_HOME" && exec /bin/sh -c "$*"
+"""
+
+
+class Remote(Base):
+    def setUp(self):
+        super().setUp()
+        self.home = self.cwd / "remote-home"
+        self.proj = self.home / "proj"
+        (self.proj / "src").mkdir(parents=True)
+        (self.proj / "src" / "app.py").write_text("x = 1\nretry_limit = 3\n")
+        (self.proj / ".env").write_text("TOKEN=hunter2\n")
+        fake = self.cwd / "fake-ssh"
+        fake.write_text(FAKE_SSH)
+        fake.chmod(0o755)
+        self.old = lowctx.SSH, os.environ.get("FAKE_HOME")
+        lowctx.SSH, os.environ["FAKE_HOME"] = str(fake), str(self.home)
+        self.local = self.cwd / "here"
+        self.local.mkdir()
+        self.r = lowctx.Agent(self.local, 12000, 20, False, "code", quiet=True, ssh="box:~/proj")
+        self.t = self.r.tools
+
+    def tearDown(self):
+        self.r.transcript.close()
+        lowctx.SSH = self.old[0]
+        if self.old[1] is None:
+            os.environ.pop("FAKE_HOME", None)
+        else:
+            os.environ["FAKE_HOME"] = self.old[1]
+        super().tearDown()
+
+    def test_target_and_prompt(self):
+        self.assertEqual(self.t.root, str(self.proj.resolve()))
+        self.assertEqual(self.t.where, f"box:{self.proj.resolve()}")
+        self.assertIn("remote machine box", self.r.system()["content"])
+        self.assertEqual(lowctx.RemoteTools(self.local, self.r.store, "box", "proj").root, self.t.root)
+        self.assertEqual(lowctx.RemoteTools(self.local, self.r.store, "box", str(self.proj)).root, self.t.root)
+        self.assertEqual(lowctx.parse_ssh_target("[2001:db8::1]:/srv/app"), ("2001:db8::1", "/srv/app"))
+        self.assertEqual(lowctx.parse_ssh_target("me@[fe80::1%en0]"), ("me@fe80::1%en0", ""))
+        self.assertEqual(lowctx.parse_ssh_target("me@box:~/a:b"), ("me@box", "~/a:b"))
+        for bad in ("", ":x", "-oProxyCommand=x:y", "a b:c"):
+            self.assertRaises(ValueError, lowctx.parse_ssh_target, bad)
+        self.assertRaises(lowctx.SSHError, lowctx.RemoteTools, self.local, self.r.store, "down", "")
+        self.assertRaises(lowctx.SSHError, lowctx.RemoteTools, self.local, self.r.store, "box", "nope")
+
+    def test_file_tools_act_on_the_remote(self):
+        t = self.t
+        self.assertEqual(t.run("ls", {}), ".env  (14b)\nsrc/")
+        self.assertIn("app.py  (22b) is a file", t.run("ls", {"path": "src/app.py"}))
+        self.assertIn("does not exist", t.run("ls", {"path": "zzz"}))
+        self.assertIn("   2| retry_limit = 3", t.run("read", {"path": "src/app.py"}))
+        self.assertIn("is a directory", t.run("read", {"path": "src"}))
+        self.assertIn("does not exist", t.run("read", {"path": "nope.txt"}))
+        self.assertEqual(t.run("grep", {"pattern": "retry_limit"}), "src/app.py:2:retry_limit = 3")
+        self.assertEqual(t.run("grep", {"pattern": "zzz"}), "no matches")
+        odd = "it's $HOME `x` \"q\"\n"
+        self.assertIn("ok: edited", t.run("edit", {"path": "src/app.py", "old": "x = 1\n", "new": odd}))
+        self.assertEqual((self.proj / "src/app.py").read_text(), odd + "retry_limit = 3\n")
+        self.assertIn("occurs 0", t.run("edit", {"path": "src/app.py", "old": "zzz", "new": "y"}).replace("not found", "occurs 0"))
+        self.assertIn("ok: wrote", t.run("write", {"path": "new dir/it's.txt", "content": "hi\n"}))
+        self.assertEqual((self.proj / "new dir" / "it's.txt").read_text(), "hi\n")
+        out = t.run("bash", {"cmd": "pwd; echo oops >&2; exit 3"})
+        self.assertTrue(out.startswith(f"exit=3\n{self.proj.resolve()}"), out)
+        self.assertIn("[stderr]\noops", out)
+        self.assertFalse((self.local / "src").exists())  # nothing landed in the local folder
+        (self.proj / "locked").mkdir(mode=0o300)  # enter, but not list
+        self.assertIn("permission denied", t.run("ls", {"path": "locked"}))
+        (self.proj / "locked").chmod(0o700)
+        (self.proj / "page.html").write_text("<html><body><p>hello there</p></body></html>")
+        os.symlink(self.proj / "page.html", self.proj / "page.txt")  # the type is the resolved file's
+        self.assertNotIn("<p>", t.run("read", {"path": "page.txt"}))
+
+    def test_lowctx_paths_stay_local(self):
+        t = self.t
+        self.assertIn("ok: wrote", t.run("write", {"path": ".lowctx/note.txt", "content": "plum\n"}))
+        self.assertEqual((self.local / ".lowctx" / "note.txt").read_text(), "plum\n")
+        self.assertFalse((self.proj / ".lowctx").exists())
+        self.assertIn("1| plum", t.run("read", {"path": ".lowctx/note.txt"}))
+        rel = self.r.save_input("a long paste")
+        self.assertIsNone(lowctx.worker_blocked(t, "read", {"path": rel}))
+        (self.local / "README.md").write_text("local only\n")
+        os.symlink("../README.md", self.local / ".lowctx" / "alias")  # out of .lowctx into the local folder
+        self.assertIn("outside", lowctx.worker_blocked(t, "read", {"path": ".lowctx/alias"}))
+
+    def test_workers_stay_inside_and_off_secrets(self):
+        t = self.t
+        self.assertIsNone(lowctx.worker_blocked(t, "read", {"path": "src/app.py"}))
+        self.assertIn("off limits", lowctx.worker_blocked(t, "read", {"path": ".env"}))
+        self.assertIn("outside", lowctx.worker_blocked(t, "read", {"path": "/etc/hosts"}))
+        self.assertIn("outside", lowctx.worker_blocked(t, "ls", {"path": "../"}))
+        (self.home / "id_ed25519").write_text("key")
+        os.symlink(self.home, self.proj / "up")  # a link inside the folder pointing out of it
+        self.assertIn("outside", lowctx.worker_blocked(t, "read", {"path": "up/id_ed25519"}))
+        self.assertNotIn(".env", lowctx.worker_filter(t.run("grep", {"pattern": "TOKEN|retry"})))
+        # the file is swapped for a link to a key after the check passed: the read itself refuses it
+        (self.proj / "notes.txt").write_text("fine\n")
+        self.assertIsNone(lowctx.worker_blocked(t, "read", {"path": "notes.txt"}))
+        (self.proj / "notes.txt").unlink()
+        os.symlink(self.home / "id_ed25519", self.proj / "notes.txt")
+        self.assertIn("outside", t.read_full("notes.txt"))
+        (self.proj / "notes.txt").unlink()
+        os.symlink(self.proj / ".env", self.proj / "notes.txt")
+        self.assertIn("off limits", t.read_full("notes.txt"))
+        (self.proj / "notes.txt").unlink()
+        os.symlink(self.home / "id_ed25519", self.proj / "notes.txt")  # grep names the real file, and the filter drops it
+        out = t.run("grep", {"pattern": "key", "path": "notes.txt"})
+        self.assertIn("id_ed25519:1:key", out)
+        self.assertEqual(lowctx.worker_filter(out), "no matches")
+        self.assertEqual(t.run("grep", {"pattern": "retry", "path": "src/app.py"}), "src/app.py:2:retry_limit = 3")
+        self.assertIn("retry_limit", t.read_full("src/app.py"))
+        self.assertIn("key", t.run("read", {"path": "up/id_ed25519"}))  # the lead itself may still read anything
+
+    def test_remote_session_kept_apart(self):
+        self.assertNotEqual(self.r.session_file, self.r.store / "session.json")
+        self.r.notes = "remote notes"
+        self.r.save_session()
+        self.assertFalse((self.r.store / "session.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
