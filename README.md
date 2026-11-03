@@ -116,18 +116,35 @@ work. What you do with it is on you. Read the model card.
 | `porthole run "task"` | one-shot: do the task in this folder, print the result, exit (code mode) |
 | `porthole run --mode advisor "question"` | one-shot opinion |
 | `porthole chat --mode code --ssh myserver:/srv/app` | work on a folder on another machine over ssh (see below) |
-| `porthole up` / `porthole down` | start / stop the model server. **down frees ~16 GB**; do it when you're done |
+| `porthole up` / `porthole down` | start / stop the model server. It also unloads itself after 5 min unused (see below); **down frees the ~16 GB now** |
 | `porthole status` | server, model, subagents, free memory |
 | `porthole doctor` | checks the machine and the install |
 | `porthole pull [quant]` | downloads weights from Hugging Face |
 
-One session per folder: run `porthole` again in the same folder and it picks up the notes, recent turns and
+One conversation per folder: run `porthole` again in the same folder and it picks up the notes, recent turns and
 mode from last time (`.lowctx/session.json`; an explicit `--mode` wins). `.lowctx/notes.md` is a readable copy of
-the notes, rewritten after every turn. `porthole --new` or `/new` starts fresh; `porthole run` one-shots leave the
-session alone.
+the notes, rewritten after every turn. `porthole run` one-shots leave the conversation alone.
 
-In chat: `/new` clears the conversation, `/notes` shows the compressed memory, `/mode code|advisor` switches
-mode, `/quit` exits. Paste anything, any length: the prompt reads the terminal's bracketed paste, so a paste
+**The folder's `.lowctx/` is the only place a conversation is kept.** porthole writes nothing about it anywhere
+else on disk (the server log has token counts and timings, never text). `.lowctx/` is readable only by you (mode
+700) and git-ignored. To erase a conversation, delete `.lowctx/` or `.lowctx/session.json`, or type `/new` (or start
+with `porthole --new`): the session, notes, transcript, saved outputs and pastes all go. If you delete them while a
+chat is open, porthole notices before the next message and forgets the conversation instead of saving it back.
+(What the helper model was sent is the provider's to keep; see Privacy.)
+
+**`/incognito`** starts a separate conversation with a violet `incognito>` prompt. It is never saved or logged, and
+whatever it wrote to `.lowctx/` (big outputs, pastes) is erased when it ends: `/quit`, Ctrl+C or Ctrl+D at the
+prompt, or closing the terminal. If porthole is killed outright, the next start erases the leftovers. `/incognito`
+again ends it and returns to the folder's own conversation, which incognito never touches.
+
+**The model unloads itself when unused.** After 5 minutes with no request running and no chat turn in progress,
+the server exits and frees its ~16 GB. Your next message loads it again (a spinner shows `loading Qwen into memory`,
+typically 20–60 s), and `porthole` starts loading it in the background as soon as you open a chat. A long turn never
+unloads mid-way: tools and subagents count as use. Set `QWEN_IDLE_MIN` (in `.env` or the environment) to change the
+minutes, or `0` to keep it loaded. A server you start by hand with `start-server.sh` never unloads itself.
+
+In chat: `/new` erases the conversation, `/notes` shows the compressed memory, `/mode code|advisor` switches
+mode, `/incognito` toggles incognito, `/quit` exits. Paste anything, any length: the prompt reads the terminal's bracketed paste, so a paste
 arrives whole and Enter inside it is a newline. Long or multi-line pastes show as `[pasted 3,412 chars, 57 lines]`
 and backspace removes one in a go; end a typed line with `\` for a new line. Ctrl+C stops a reply (the turn is
 discarded) or clears the prompt. Messages over ~30% of the token budget are saved to `.lowctx/` and replaced by a
@@ -248,7 +265,8 @@ problems). `bench/probe.py tools|needle N,N|cache` probes tool calling, long-con
 
 ## Known limitations
 
-* Local is slow: expect 20–60 s per agent step and ~17 tok/s output. Use `porthole down` when idle.
+* Local is slow: expect 20–60 s per agent step and ~17 tok/s output. The first message after an idle unload
+  also waits for the model to load again.
 * Memory is everything. If other apps (VMs, games, DAWs, a heavy browser) already push the Mac into swap, a
   4k-token step can go from ~20 s to several minutes. `porthole up` warns when free RAM is below what the weights need.
 * Notes are lossy. Exact figures from many turns back survive only if the compressor kept them

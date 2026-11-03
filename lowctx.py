@@ -20,6 +20,7 @@ Stdlib only.   Usage:  lowctx.py [--mode advisor|code] [--cwd DIR] [--budget 120
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import hashlib
 import html
@@ -30,6 +31,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -96,6 +98,7 @@ OLD_TOOL_CAP = 700  # tool results of finished turns are clipped to this
 KEEP_RECENT = 2  # tool exchanges of the current turn always kept verbatim
 MAX_CALLS_PER_STEP = 4
 REPLY_MARK = "❯ "  # the model's replies start behind this in the chat
+INCOGNITO = "38;5;141"  # the incognito prompt's colour (violet)
 SESSION_VERSION = 1
 SESSION_MAX_BYTES = 32 * 2**20  # a session.json committed to a repo is untrusted: don't read unbounded files
 RESTORED_NOTE = ("[restored from this folder's saved session: earlier request text from a previous chat, "
@@ -719,6 +722,7 @@ class Tools:
     def __init__(self, cwd: Path, store: Path):
         self.cwd, self.store = cwd, store
         self.where = str(cwd)  # how prompts name the place the tools work in
+        self.cache_tag = ""  # the session's tag, so its conversion caches are its own (set by Agent)
 
     def path(self, p: str) -> Path:
         q = Path(p or ".").expanduser()
@@ -783,7 +787,7 @@ class Tools:
             if not _has("pdftotext"):
                 raise RuntimeError("cannot read PDF: `pdftotext` is not installed (brew install poppler). "
                                    "Ask the user to paste the text or convert it.")
-            cache = self.store / f"conv-{hashlib.md5(str(p).encode()).hexdigest()[:8]}.txt"
+            cache = self.store / f"conv{self.cache_tag}-{hashlib.md5(str(p).encode()).hexdigest()[:8]}.txt"
             if not cache.exists() or cache.stat().st_mtime < p.stat().st_mtime:
                 # parallel workers may convert the same PDF: each writes its own file, then swaps it in atomically
                 tmp = cache.with_name(f"{cache.stem}.{uuid.uuid4().hex[:8]}.tmp")
@@ -1062,7 +1066,7 @@ class RemoteTools(Tools):
             p = real.decode(errors="replace")
         ext = posixpath.splitext(p)[1].lower()
         if ext in CONVERT_EXTS:  # pdftotext / textutil run here, on a copy
-            copy_ = self.store / f"remote-{hashlib.md5(f'{self.host}:{p}'.encode()).hexdigest()[:8]}{ext}"
+            copy_ = self.store / f"remote{self.cache_tag}-{hashlib.md5(f'{self.host}:{p}'.encode()).hexdigest()[:8]}{ext}"
             # write a fresh file and swap it in: never write through a planted symlink at copy_
             tmp = copy_.with_name(f"{copy_.stem}.{uuid.uuid4().hex[:8]}.tmp")
             tmp.write_bytes(data)
@@ -1498,19 +1502,7 @@ class Agent:
         self.mode, self.stream, self.quiet = mode, stream, quiet
         self.direct = False
         self.store = cwd / ".lowctx"
-        if self.store.is_symlink():  # a checkout's .lowctx link would send every write to its target: replace the link itself
-            self.store.unlink()
-        self.store.mkdir(exist_ok=True)
-        # session data (the whole conversation) must never land in a commit; rewrite so an older, partial ignore file is fixed too
-        # unlink first: a repo-supplied .gitignore may be a symlink, and write_text would write through it
-        gi = self.store / ".gitignore"
-        if gi.is_dir() and not gi.is_symlink():  # never recurse into it: it may hold the user's files
-            try:
-                gi.rmdir()  # removes only an empty directory
-            except OSError as e:
-                raise SystemExit(f"{gi} is a directory with contents; move it aside to use lowctx here ({e})") from None
-        gi.unlink(missing_ok=True)
-        (self.store / ".gitignore").write_text("*\n")
+        self.prepare_store()
         if ssh:  # files and bash on another machine; the session and scratch files stay here
             host, path = parse_ssh_target(ssh)
             self.tools = RemoteTools(cwd, self.store, host, path)
@@ -1518,7 +1510,9 @@ class Agent:
             self.session_tag = "-ssh-" + hashlib.md5(self.tools.where.encode()).hexdigest()[:8]
         else:
             self.tools, self.session_tag = Tools(cwd, self.store), ""
+        self.base_tag = self.session_tag
         self.tools.log = self.log
+        self.tools.cache_tag = self.session_tag
         self.model = LOCAL_MODEL
         self.comp = Compressor(self.log, self.get_model)
         self.goal = ""  # current user message (used to focus digests)
@@ -1529,7 +1523,110 @@ class Agent:
         self.session_turns = 0  # turns in this folder's session, across restarts
         self.streamed = False
         self.stats = {"steps": 0, "compactions": 0, "digests": 0, "prompt_tokens": [], "secs": 0.0, "turns": 0}
-        self.transcript = open(self.store / "transcript.jsonl", "a")
+        self.session_seen = False  # this session's file was read or written: deleting it now means "forget"
+        self.incognito = False
+        self.sweep_incognito()
+        self.transcript = open(self.transcript_file, "a")
+
+    # -- the folder's history: everything porthole keeps about a conversation lives in .lowctx/ and nowhere else
+    def prepare_store(self) -> None:
+        if self.store.is_symlink():  # a checkout's .lowctx link would send every write to its target: replace the link itself
+            self.store.unlink()
+        self.store.mkdir(exist_ok=True)
+        try:  # the conversation is private: no other user on this Mac may list or read it
+            os.chmod(self.store, 0o700)
+        except OSError:
+            pass
+        # session data (the whole conversation) must never land in a commit; rewrite so an older, partial ignore file is fixed too
+        # unlink first: a repo-supplied .gitignore may be a symlink, and write_text would write through it
+        gi = self.store / ".gitignore"
+        if gi.is_dir() and not gi.is_symlink():  # never recurse into it: it may hold the user's files
+            try:
+                gi.rmdir()  # removes only an empty directory
+            except OSError as e:
+                raise SystemExit(f"{gi} is a directory with contents; move it aside to use lowctx here ({e})") from None
+        gi.unlink(missing_ok=True)
+        (self.store / ".gitignore").write_text("*\n")
+
+    def history_files(self) -> list[Path]:
+        """This session's files in .lowctx/: the session, notes, transcript, saved outputs and pastes, and the
+        conversion caches (copies of documents it read). Another session's files (a --ssh session's) stay."""
+        tag = re.escape(self.session_tag)
+        mine = re.compile(rf"^(?:(?:session|notes|transcript){tag}\.(?:json|md|jsonl)|(?:out|page){tag}-\d+\.txt|"
+                          rf"input-\d+-\d+{tag}\.txt|(?:session|notes){tag}\.[0-9a-f]{{8}}\.tmp|(?:conv|remote){tag}-[0-9a-f]{{8}}[.\w]*)$")
+        if self.store.is_symlink():  # enumerating through the link would erase another folder's matching files
+            return []
+        try:
+            return [f for f in self.store.iterdir() if mine.match(f.name) and (f.is_symlink() or f.is_file())]
+        except OSError:
+            return []
+
+    def forget(self) -> None:
+        """Erase this conversation: its files in .lowctx/ and everything held in memory."""
+        self.transcript.close()
+        for f in self.history_files():
+            try:
+                f.unlink()
+            except OSError as e:
+                self.log(f"  [could not erase {f.relative_to(self.cwd)} ({e})]")
+        self.goal, self.notes, self.live, self.session_turns, self.n_out = "", "", [], 0, 0
+        self.session_seen = False
+        self.prepare_store()
+        self.transcript = self.open_transcript()
+
+    def open_transcript(self):
+        # incognito keeps no log at all; its saved outputs and pastes are erased when it ends
+        return open(os.devnull, "a") if self.incognito else open(self.transcript_file, "a")
+
+    def set_incognito(self, on: bool) -> None:
+        """Incognito: a separate conversation that is never saved and is erased when it ends. Turning it off
+        erases it and resumes this folder's own conversation."""
+        if on == self.incognito:
+            return
+        if not on:
+            self.forget()
+        self.transcript.close()
+        self.incognito = on
+        self.session_tag = (self.base_tag + f"-incognito-{os.getpid()}") if on else self.base_tag
+        self.tools.cache_tag = self.session_tag
+        self.goal, self.notes, self.live, self.session_turns, self.n_out = "", "", [], 0, 0
+        self.session_seen = False
+        self.transcript = self.open_transcript()
+        if not on:
+            self.load_session(restore_mode=False)
+
+    def sweep_incognito(self) -> None:
+        """Erase what an incognito chat left behind when it was killed before it could clean up."""
+        try:
+            names = [f for f in self.store.iterdir() if f.is_file() or f.is_symlink()]
+        except OSError:
+            return
+        for f in names:
+            m = re.search(r"-incognito-(\d+)", f.name)
+            if not m:
+                continue
+            try:
+                os.kill(int(m.group(1)), 0)
+                continue  # that chat is still running
+            except PermissionError:
+                continue
+            except (OSError, OverflowError, ValueError):
+                pass
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    def check_store(self) -> str:
+        """Forget the conversation if the user deleted .lowctx/ or the session file since it was last saved,
+        instead of writing it all back. Returns what happened, or ""."""
+        if not self.store.is_dir() or self.store.is_symlink():
+            self.forget()
+            return ".lowctx/ was deleted: this conversation is forgotten"
+        if self.session_seen and not self.session_file.exists():
+            self.forget()
+            return f"{self.session_file.relative_to(self.cwd)} was deleted: this conversation is forgotten and erased"
+        return ""
 
     # -- io
     def log(self, s: str) -> None:
@@ -1563,12 +1660,7 @@ class Agent:
         self.mode = mode
 
     def reset(self) -> None:
-        self.goal, self.notes, self.live, self.session_turns = "", "", [], 0
-        for f in (self.session_file, self.notes_file):
-            try:
-                f.unlink(missing_ok=True)
-            except OSError as e:  # e.g. a repo-supplied directory here: leave its contents alone and start fresh
-                self.log(f"  [could not clear {f.relative_to(self.cwd)} ({e})]")
+        self.forget()
 
     # -- session: one per folder, so a restart picks up where the last chat left off
     @property
@@ -1579,6 +1671,10 @@ class Agent:
     def notes_file(self) -> Path:  # a readable copy of the notes; never read back
         return self.store / f"notes{self.session_tag}.md"
 
+    @property
+    def transcript_file(self) -> Path:  # every message and tool call; never read back
+        return self.store / f"transcript{self.session_tag}.jsonl"
+
     def save_session(self) -> None:
         data = {"version": SESSION_VERSION, "saved": time.time(), "notes": self.notes, "live": self.live,
                 "n_out": self.n_out, "turns": self.session_turns, "mode": self.mode}
@@ -1588,6 +1684,7 @@ class Agent:
             tmp = f.with_name(f"{f.stem}.{uuid.uuid4().hex[:8]}.tmp")
             tmp.write_text(body)
             os.replace(tmp, f)  # never leave a half-written file behind, and never write through a planted symlink
+            self.session_seen = True  # session.json is on disk now: deleting it means "forget", even if notes.md fails
 
     def read_session_bytes(self) -> bytes:
         """At most SESSION_MAX_BYTES + 1 bytes, and only from a regular file: opening a FIFO for reading blocks
@@ -1636,6 +1733,7 @@ class Agent:
             self.log(f"  [{self.session_file.relative_to(self.cwd)} is malformed ({e}); starting fresh]")
             return None
         self.notes = notes
+        self.session_seen = True
         self.n_out = max(self.n_out, n_out)  # don't overwrite out-N files old notes point at
         self.session_turns = turns
         if mode and restore_mode:
@@ -2125,8 +2223,9 @@ class Agent:
 # ---------------------------------------------------------------- cli
 
 
-HELP = ("commands: /new  /notes  /mode code|advisor  /help  /quit   (this folder keeps its notes, turns and mode;\n"
-        "  .lowctx/notes.md is a readable copy of the notes)\n"
+HELP = ("commands: /new  /notes  /mode code|advisor  /incognito  /help  /quit\n"
+        "  this folder's conversation lives in .lowctx/ (session.json; notes.md is a readable copy). Delete it, or /new,\n"
+        "  and it is gone. /incognito: a conversation that is never saved and is erased when the chat ends.\n"
         "paste anything, any length: it arrives whole. Long or multi-line pastes show as [pasted …]; backspace "
         "removes one in a go.\nA very long paste is saved to .lowctx/ and briefed; what you type around it is kept word for word.\n"
         "new line while typing: end the line with \\ (or wrap the message in \"\"\")."
@@ -2367,8 +2466,9 @@ def read_input_lines(prompt: str = "you> ") -> str:
     return "\n".join(lines).strip()
 
 
-def main(argv: list | None = None, header=None, prog: str | None = None) -> None:
-    """CLI loop. `header(agent)` replaces the plain startup line (porthole draws its banner there)."""
+def main(argv: list | None = None, header=None, prog: str | None = None, turn_guard=None) -> None:
+    """CLI loop. `header(agent)` replaces the plain startup line (porthole draws its banner there). `turn_guard()`,
+    if given, returns a context manager each turn runs inside (porthole loads the model there if it was unloaded)."""
     global LOCAL_URL, LOCAL_MODEL
     ap = argparse.ArgumentParser(prog=prog, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("task", nargs="*", help="optional first message")
@@ -2432,63 +2532,95 @@ def main(argv: list | None = None, header=None, prog: str | None = None) -> None
     elif agent.mode != default_mode and not (a.once or a.new or explicit_mode):  # a saved /mode, no turns yet
         print(_c("2", f"  this folder's session is in {agent.mode} mode  ·  /mode {default_mode} switches") + "\n")
     task = " ".join(a.task).strip()
-    while True:
-        if not task:
-            try:
-                task = read_input()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return
-        low = task.lower()
-        if low in ("/quit", "/exit", "/q"):
-            return
-        if low == "/new":
-            agent.reset()
-            print("new conversation (notes and saved session cleared)")
-        elif low == "/notes":
-            # notes may come from a repo-supplied session.json: show control characters escaped, not executed
-            print(re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", lambda m: f"\\x{ord(m.group()):02x}", agent.notes)
-                  or "(no notes yet)")
-        elif low == "/help":
-            print(HELP)
-        elif low.startswith("/mode"):
-            parts = low.split()
-            if len(parts) == 2 and parts[1] in ("code", "advisor"):
-                agent.set_mode(parts[1])
-                print(f"mode: {agent.mode}")
-                if not a.once:  # remembered for this folder, even if no turn follows
-                    try:
-                        agent.save_session()
-                    except OSError as e:
-                        print(f"  [could not save the session: {e}]")
-            else:
-                print(f"mode: {agent.mode}  (usage: /mode code|advisor)")
-        elif task.startswith("/") and " " not in task and len(task) < 20:
-            print("unknown command; /help")
-        elif task:
-            if sys.stdout.isatty():
-                print()  # the reply starts below the prompt line, not glued to it
-            WAIT.show("sending")  # at once, before any slow work: the turn has visibly started
-            try:
-                ans = agent.run(task)
-                if not agent.streamed:
-                    print(format_reply(ans) if sys.stdout.isatty() else "\n" + ans)
-                if not a.once:
-                    try:
-                        agent.save_session()
-                    except OSError as e:
-                        print(f"  [could not save the session: {e}]")
-                print(_c("2", agent.summary()) + "\n")
-            except KeyboardInterrupt:
-                WAIT.hide()
-                print("\n(interrupted; the turn was discarded)\n")
-            except Exception as e:  # noqa: BLE001
-                WAIT.hide()
-                print(f"\n[error: {e}] — the turn was rolled back; try again or /new\n")
-        task = ""
-        if a.once:
-            return
 
+    def hang_up(signum, frame):  # closing the terminal (SIGHUP) or a kill: leave through the finally below
+        raise SystemExit(128 + signum)
+    before = {sig: signal.signal(sig, hang_up) for sig in (signal.SIGHUP, signal.SIGTERM)}
+    try:
+        while True:
+            if not task:
+                try:
+                    task = read_input(_c(INCOGNITO, "incognito> ")) if agent.incognito else read_input()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return
+            low = task.lower()
+            if low in ("/quit", "/exit", "/q"):
+                return
+            gone = agent.check_store()
+            if gone:
+                print(_c("2", f"  {gone}"))
+            if low == "/new":
+                agent.reset()
+                print("new conversation (this folder's history in .lowctx/ erased)")
+            elif low in ("/incognito", "/incognito on", "/incognito off"):
+                on = not agent.incognito if low == "/incognito" else low.endswith("on")
+                if a.once:
+                    print("incognito is for chats; a one-shot run is never resumed anyway")
+                elif on == agent.incognito:
+                    print(f"incognito is already {'on' if on else 'off'}")
+                elif on:
+                    agent.set_incognito(True)
+                    print(_c(INCOGNITO, "  incognito: a separate conversation, never saved. It is erased when you /quit, "
+                                        "press Ctrl+C or close the terminal.\n  /incognito again ends it and returns "
+                                        "to this folder's conversation."))
+                else:
+                    agent.set_incognito(False)
+                    print(_c("2", "  incognito ended and erased; back to this folder's conversation"
+                                  + (f" ({agent.session_turns} turns)" if agent.session_turns else "")))
+            elif low == "/notes":
+                # notes may come from a repo-supplied session.json: show control characters escaped, not executed
+                print(re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", lambda m: f"\\x{ord(m.group()):02x}", agent.notes)
+                      or "(no notes yet)")
+            elif low == "/help":
+                print(HELP)
+            elif low.startswith("/mode"):
+                parts = low.split()
+                if len(parts) == 2 and parts[1] in ("code", "advisor"):
+                    agent.set_mode(parts[1])
+                    print(f"mode: {agent.mode}")
+                    if not (a.once or agent.incognito):  # remembered for this folder, even if no turn follows; incognito is never saved
+                        try:
+                            agent.save_session()
+                        except OSError as e:
+                            print(f"  [could not save the session: {e}]")
+                else:
+                    print(f"mode: {agent.mode}  (usage: /mode code|advisor)")
+            elif task.startswith("/") and " " not in task and len(task) < 20:
+                print("unknown command; /help")
+            elif task:
+                if sys.stdout.isatty():
+                    print()  # the reply starts below the prompt line, not glued to it
+                WAIT.show("sending")  # at once, before any slow work: the turn has visibly started
+                try:
+                    with turn_guard() if turn_guard else contextlib.nullcontext():
+                        ans = agent.run(task)
+                    if not agent.streamed:
+                        print(format_reply(ans) if sys.stdout.isatty() else "\n" + ans)
+                    gone = agent.check_store()  # deleted during the turn: forget it rather than save it back
+                    if gone:
+                        print(_c("2", f"  {gone}"))
+                    elif not (a.once or agent.incognito):
+                        try:
+                            agent.save_session()
+                        except OSError as e:
+                            print(f"  [could not save the session: {e}]")
+                    print(_c("2", agent.summary()) + "\n")
+                except KeyboardInterrupt:
+                    WAIT.hide()
+                    print("\n(interrupted; the turn was discarded)\n")
+                except Exception as e:  # noqa: BLE001
+                    WAIT.hide()
+                    print(f"\n[error: {e}] — the turn was rolled back; try again or /new\n")
+            task = ""
+            if a.once:
+                return
+
+    finally:
+        if agent.incognito:  # however the chat ends: /quit, Ctrl+C or Ctrl+D at the prompt, a closed terminal
+            agent.forget()
+        for sig, h in before.items():
+            signal.signal(sig, h)
 
 if __name__ == "__main__":
     main()

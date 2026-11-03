@@ -190,6 +190,100 @@ class Session(Base):
         self.assertEqual(seen, ["code", "advisor", "advisor"])
 
 
+class History(Base):
+    """The folder's conversation lives in .lowctx/ only, privately, and deleting it forgets it."""
+
+    def run_main(self, inputs, argv=()):
+        feed, orig = list(inputs), lowctx.read_input
+
+        def fake(prompt="you> "):
+            if not feed:
+                raise EOFError
+            return feed.pop(0)
+        lowctx.read_input = fake
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                lowctx.main(["--cwd", str(self.cwd), *argv], header=lambda ag: ag.transcript.close())
+        finally:
+            lowctx.read_input = orig
+        return out.getvalue()
+
+    def fill(self, a):
+        a.notes, a.live = "the plan is plum", [{"role": "user", "content": "hi"}]
+        a.save_session()
+        a.record("user", text="hi")
+        a.n_out = 1
+        (a.store / "out-1.txt").write_text("big output")
+        rel = a.save_input("a long paste")
+        return a.store / Path(rel).name
+
+    def test_store_is_private(self):
+        self.assertEqual(os.stat(self.cwd / ".lowctx").st_mode & 0o777, 0o700)
+
+    def test_new_erases_everything(self):
+        a = self.agent
+        paste = self.fill(a)
+        (a.store / "out-ssh-1234abcd-1.txt").write_text("another session's")
+        a.reset()
+        for f in ("session.json", "notes.md", "out-1.txt", paste.name):
+            self.assertFalse((a.store / f).exists(), f)
+        self.assertEqual((a.store / "transcript.jsonl").read_text(), "")
+        self.assertTrue((a.store / "out-ssh-1234abcd-1.txt").exists())  # a --ssh session's files stay
+        self.assertEqual((a.notes, a.live, a.n_out), ("", [], 0))
+
+    def test_deleting_the_session_forgets_it(self):
+        a = self.agent
+        self.fill(a)
+        self.assertEqual(a.check_store(), "")
+        (a.store / "session.json").unlink()
+        self.assertIn("forgotten", a.check_store())
+        self.assertEqual((a.notes, a.live), ("", []))
+        self.assertFalse((a.store / "out-1.txt").exists())
+        self.assertEqual(a.check_store(), "")  # nothing saved yet: no longer "seen"
+
+    def test_deleting_the_folder_forgets_it(self):
+        import shutil
+        a = self.agent
+        self.fill(a)
+        shutil.rmtree(a.store)
+        self.assertIn("forgotten", a.check_store())
+        self.assertEqual((a.notes, a.live), ("", []))
+        self.assertTrue((a.store / ".gitignore").exists())
+        a.record("user", text="new")  # the transcript was reopened in the new folder
+        self.assertIn("new", (a.store / "transcript.jsonl").read_text())
+
+    def test_incognito_is_separate_and_erased(self):
+        a = self.agent
+        self.fill(a)
+        a.set_incognito(True)
+        self.assertEqual((a.notes, a.live), ("", []))
+        a.record("user", text="secret")
+        a.n_out = 3
+        paste = a.store / Path(a.save_input("incognito paste")).name
+        self.assertIn("incognito", paste.name)
+        a.set_incognito(False)
+        self.assertFalse(paste.exists())
+        self.assertNotIn("secret", (a.store / "transcript.jsonl").read_text())
+        self.assertEqual(a.notes, "the plan is plum")  # the folder's own conversation is back
+
+    def test_incognito_chat_leaves_nothing(self):
+        self.agent.transcript.close()
+        self.run_main(["/incognito"])  # then Ctrl+D at the prompt
+        self.assertFalse(any("incognito" in f.name for f in (self.cwd / ".lowctx").iterdir()))
+        self.assertFalse((self.cwd / ".lowctx" / "session.json").exists())
+
+    def test_killed_incognito_is_swept(self):
+        store = self.cwd / ".lowctx"
+        dead = store / "input-1-1-incognito-999999.txt"
+        dead.write_text("left behind")
+        live = store / f"input-1-2-incognito-{os.getpid()}.txt"
+        live.write_text("still running")
+        b = lowctx.Agent(self.cwd, 12000, 20, False, quiet=True)
+        b.transcript.close()
+        self.assertFalse(dead.exists())
+        self.assertTrue(live.exists())
+
+
 # Stands in for ssh: '[-o opt]... -- host command', run by /bin/sh in $FAKE_HOME like a remote login shell would.
 FAKE_SSH = """#!/bin/sh
 while [ "$1" != "--" ]; do shift; done
