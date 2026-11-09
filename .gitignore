@@ -12,6 +12,9 @@
 !/requant.py
 !/requirements.txt
 !/bench/
+!/gui/
+/gui/node_modules/
+/gui/dist/
 /bench/*
 !/bench/probe.py
 !/bench/run_tests.py

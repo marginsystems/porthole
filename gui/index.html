@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>porthole lab</title>
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand"><span class="dot" id="status-dot"></span> porthole <span class="dim">lab</span></div>
+      <nav id="tabs">
+        <button data-tab="chat" class="on">Chat</button>
+        <button data-tab="anatomy">Anatomy</button>
+        <button data-tab="tests">Tests</button>
+        <button data-tab="tuning">Tuning</button>
+        <span class="tab-mark" id="tab-mark"></span>
+      </nav>
+      <div class="server">
+        <span id="status-text" class="dim">checking server…</span>
+        <button id="load-btn" class="ghost">Load model</button>
+      </div>
+    </header>
+    <main>
+      <section id="chat" class="view on"></section>
+      <section id="anatomy" class="view"></section>
+      <section id="tests" class="view"></section>
+      <section id="tuning" class="view"></section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

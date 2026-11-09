@@ -120,6 +120,7 @@ work. What you do with it is on you. Read the model card.
 | `porthole status` | server, model, subagents, free memory |
 | `porthole doctor` | checks the machine and the install |
 | `porthole pull [quant]` | downloads weights from Hugging Face |
+| `porthole gui` | opens the lab in your browser (see below); needs Node |
 
 One conversation per folder: run `porthole` again in the same folder and it picks up the notes, recent turns and
 mode from last time (`.lowctx/session.json`; an explicit `--mode` wins). `.lowctx/notes.md` is a readable copy of
@@ -175,6 +176,24 @@ porthole run --ssh deploy@10.0.0.5:/srv/api "why does the health check fail? fix
   converted on your Mac.
 * bash runs real commands on that machine. Point it at a staging box or a checkout, not at production, unless you
   mean it.
+
+## The lab (`porthole gui`)
+
+A small browser app in `gui/` (Vite + TypeScript) for poking at the model itself rather than using it as an agent.
+`porthole gui` installs its packages on first run and opens http://127.0.0.1:5173. Opening it does not load the
+model: the **Load model** button runs `porthole up`, and the model still unloads itself when idle.
+
+* **Chat**: talk to the bare model (no harness, no tools) with temperature, top_p, top_k, thinking and a system
+  prompt. Each token is shaded by how sure the model was; hover to see the runners-up (start the server with
+  `TOP_LOGPROBS_K=5 porthole up` to get them).
+* **Anatomy**: exact parameter counts, read from the safetensors headers on disk: per component, per layer, the
+  64-layer map, how many MLP neurons there are, and what "open weights" does and doesn't give you.
+* **Tests**: a small auto-graded suite (arithmetic, reasoning, format, instruction following, candor) plus your own
+  prompt + regex tests. Label each run ("baseline", "my-lora v1") and compare scores in the history.
+* **Tuning**: what you can change, cheapest first: prompts, sampling, thinking, LoRA, steering, full fine-tunes,
+  and why hand-editing neurons doesn't make a smarter model.
+
+`QWEN_URL` points the lab at another server; `PORTHOLE_WEIGHTS` at another weights folder.
 
 ## Use cases
 
@@ -287,6 +306,7 @@ start-server.sh   mlx_vlm server with memory-safe defaults
 install.sh        venv + mlx-vlm + PATH link
 requant.py        8-bit → 4-bit re-quantizer (shard by shard)
 bench/            live tests and fixtures
+gui/              the lab: browser chat, model anatomy, test suite (Vite + TypeScript)
 ```
 
 ## License

@@ -358,6 +358,8 @@ HELP = f"""{c(BOLD, 'usage')}
   porthole status                server, model, subagents, free memory
   porthole doctor                check this machine and the install
   porthole pull [4-bit|6-bit|8-bit]   download Qwen weights from Hugging Face
+  porthole gui                   open the lab in a browser: chat with confidence colours,
+                                 the model's anatomy, a test suite (needs Node; does not load the model)
 
 {c(BOLD, 'chat flags')}  --cwd DIR  --ssh HOST:PATH  --new  --budget TOKENS  --steps N  --think  --no-stream
 {c(BOLD, 'env')}         HELPER_URL HELPER_KEY HELPER_MODEL (in .env)  QWEN_QUANT  QWEN_KV  QWEN_IDLE_MIN  LOWCTX_URL  LOWCTX_MODEL
@@ -381,6 +383,23 @@ def cmd_chat(argv: list, one_shot: bool = False) -> int:
     return 0
 
 
+def cmd_gui() -> int:
+    """The browser lab in gui/ (Vite + TypeScript). Installs its packages on first run."""
+    gui = ROOT / "gui"
+    npm = shutil.which("npm")
+    if not npm:
+        bad("porthole gui needs Node.js (npm): brew install node")
+        return 1
+    if not (gui / "node_modules").exists():
+        info("installing the lab's packages (first run)…")
+        if subprocess.run([npm, "install", "--no-fund", "--no-audit"], cwd=gui).returncode:
+            return 1
+    try:
+        return subprocess.run([npm, "run", "dev", "--", "--open"], cwd=gui).returncode
+    except KeyboardInterrupt:
+        return 0
+
+
 def main() -> int:
     argv = sys.argv[1:]
     cmd = argv[0] if argv and not argv[0].startswith("-") else "chat"
@@ -396,7 +415,7 @@ def main() -> int:
         "chat": lambda: cmd_chat(rest),
         "run": lambda: cmd_chat(rest, one_shot=True),
         "up": cmd_up, "down": cmd_down, "status": cmd_status, "doctor": cmd_doctor,
-        "pull": lambda: cmd_pull(rest),
+        "pull": lambda: cmd_pull(rest), "gui": cmd_gui,
     }
     if cmd not in table:  # `porthole what should I do about X` → chat with that as the first message
         return cmd_chat(argv)
